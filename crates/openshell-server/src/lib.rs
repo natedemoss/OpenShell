@@ -441,7 +441,10 @@ pub(crate) async fn run_server(
     let ServerStartupConfig {
         config,
         config_file,
+        #[cfg(not(target_os = "windows"))]
         guest_tls,
+        #[cfg(target_os = "windows")]
+        guest_tls: _,
         compute_driver: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
