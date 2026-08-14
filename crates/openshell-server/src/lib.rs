@@ -245,6 +245,7 @@ use tracing_bus::TracingLogBus;
 pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
+    #[cfg(not(target_os = "windows"))]
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
     pub compute_driver: ComputeDriverSelection,
 }
@@ -443,8 +444,6 @@ pub(crate) async fn run_server(
         config_file,
         #[cfg(not(target_os = "windows"))]
         guest_tls,
-        #[cfg(target_os = "windows")]
-        guest_tls: _,
         compute_driver: _,
     } = startup;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

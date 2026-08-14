@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
+#[cfg(not(target_os = "windows"))]
 use crate::compute::driver_config::GuestTlsPaths;
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::defaults::{self, LocalTlsPaths};
@@ -265,7 +266,10 @@ fn prepare_server_config(
     let compute_driver_kind = compute_driver.name().parse::<ComputeDriverKind>().ok();
 
     let local_tls = apply_runtime_defaults(args)?;
+    #[cfg(not(target_os = "windows"))]
     let guest_tls = local_tls.as_ref().map(GuestTlsPaths::from);
+    #[cfg(target_os = "windows")]
+    let _ = local_tls;
     let local_jwt = defaults::complete_local_jwt_config()?;
 
     let bind = SocketAddr::new(args.bind_address, args.port);
@@ -477,6 +481,7 @@ fn prepare_server_config(
     Ok(ServerStartupConfig {
         config,
         config_file: file,
+        #[cfg(not(target_os = "windows"))]
         guest_tls,
         compute_driver,
     })
