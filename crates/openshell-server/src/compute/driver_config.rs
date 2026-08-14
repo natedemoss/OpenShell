@@ -11,6 +11,7 @@
 pub mod builtin;
 
 use crate::config_file;
+#[cfg(not(target_os = "windows"))]
 use crate::defaults::LocalTlsPaths;
 use openshell_core::{Error, Result};
 use serde::Deserialize;
@@ -18,18 +19,21 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_os = "windows"))]
 pub struct GuestTlsPaths {
     ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl GuestTlsPaths {
     pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
         (&self.ca, &self.cert, &self.key)
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
