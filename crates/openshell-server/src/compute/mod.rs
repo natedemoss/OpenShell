@@ -397,7 +397,7 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
-    #[cfg(any(test, feature = "in-tree-compute-drivers"))]
+    #[cfg(all(unix, any(test, feature = "in-tree-compute-drivers")))]
     pub(crate) fn managed_builtin(
         driver_kind: ComputeDriverKind,
         channel: Channel,
@@ -410,6 +410,7 @@ impl AcquiredRemoteDriverEndpoint {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn unmanaged(name: impl Into<String>, channel: Channel) -> Self {
         Self {
             name: name.into(),
@@ -557,6 +558,7 @@ impl ComputeDriver for RemoteComputeDriver {
 pub struct ComputeRuntime {
     driver: TracedDriver,
     driver_info: ComputeDriverInfoSnapshot,
+    #[cfg(unix)]
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -597,6 +599,8 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        #[cfg(not(unix))]
+        let _ = driver_process;
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
@@ -675,6 +679,7 @@ impl ComputeRuntime {
         Ok(Self {
             driver: TracedDriver::new(driver, driver_name),
             driver_info,
+            #[cfg(unix)]
             driver_process,
             default_image,
             store,
@@ -3380,13 +3385,13 @@ pub async fn connect_remote_compute_driver(
 }
 
 #[cfg(not(unix))]
-pub async fn connect_remote_compute_driver(
+pub fn connect_remote_compute_driver(
     _name: impl Into<String>,
     _socket_path: &Path,
-) -> Result<AcquiredRemoteDriverEndpoint, ComputeError> {
-    Err(ComputeError::Message(
+) -> std::future::Ready<Result<AcquiredRemoteDriverEndpoint, ComputeError>> {
+    std::future::ready(Err(ComputeError::Message(
         "remote compute driver endpoints require unix domain socket support".to_string(),
-    ))
+    )))
 }
 
 fn driver_sandbox_from_public(
@@ -4247,6 +4252,7 @@ pub async fn new_test_runtime_with_driver(
             driver_version: "test".to_string(),
             gateway_manages_lifecycle: false,
         },
+        #[cfg(unix)]
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
@@ -4931,6 +4937,7 @@ mod tests {
                 driver_version: "test".to_string(),
                 gateway_manages_lifecycle: false,
             },
+            #[cfg(unix)]
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,

@@ -1432,15 +1432,18 @@ mod tests {
         ActiveMachine, ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
         GatewayJwtConfig, GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
-        detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
-        docker_host_unix_socket_path, docker_socket_responds, explicit_unix_container_host,
+        detect_driver, docker_host_unix_socket_path, explicit_unix_container_host,
         normalize_compute_driver_name, parse_default_podman_connection, parse_podman_info_socket,
         parse_podman_machine_inspect_socket, podman_connection_name_for_uri,
-        podman_machine_inspect_targets, podman_socket_candidates_from_env, podman_socket_responds,
-        resolve_active_podman_machine, run_bounded_command, unix_url_socket_path,
+        podman_machine_inspect_targets, podman_socket_candidates_from_env,
+        resolve_active_podman_machine, unix_url_socket_path,
     };
     #[cfg(unix)]
-    use super::{is_reachable_unix_socket, is_unix_socket};
+    use super::{
+        detect_docker_socket_from_candidates, detect_podman_socket_from_candidates,
+        docker_socket_responds, is_reachable_unix_socket, is_unix_socket, podman_socket_responds,
+        run_bounded_command,
+    };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
