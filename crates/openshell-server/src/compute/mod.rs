@@ -5,17 +5,6 @@
 
 pub mod driver_config;
 pub mod lease;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod vm;
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_docker::DockerComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_kubernetes::KubernetesComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use openshell_driver_podman::PodmanComputeConfig;
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -30,7 +19,6 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
-use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
@@ -50,15 +38,6 @@ use openshell_core::proto::{
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_docker::{ComputeDriverService as DockerDriverService, DockerComputeDriver};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_kubernetes::{
-    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
-    OperatorNamespaceAllowlist,
-};
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -302,8 +281,8 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
-    #[cfg(all(unix, any(test, feature = "in-tree-compute-drivers")))]
-    pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
+    #[cfg(unix)]
+    pub fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
@@ -400,14 +379,13 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
-    #[cfg(any(test, feature = "in-tree-compute-drivers"))]
-    pub(crate) fn managed_builtin(
-        driver_kind: ComputeDriverKind,
+    pub fn managed(
+        name: impl Into<String>,
         channel: Channel,
         driver_process: Arc<ManagedDriverProcess>,
     ) -> Self {
         Self {
-            name: driver_kind.as_str().to_string(),
+            name: name.into(),
             channel,
             driver_process: Some(driver_process),
         }
@@ -619,11 +597,9 @@ impl ComputeRuntime {
                 compute_error_from_status(status)
             })?
             .into_inner();
-        let driver_kind = driver_name.parse::<ComputeDriverKind>().ok();
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
-            in_tree = driver_kind.is_some(),
             "Compute driver connected"
         );
         let driver_info = ComputeDriverInfoSnapshot {
@@ -729,62 +705,6 @@ impl ComputeRuntime {
         self.lifecycle_gates.entry_count()
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_docker(
-        config: openshell_core::Config,
-        docker_config: DockerComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        let driver = DockerComputeDriver::new(&config, &docker_config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(DockerDriverService::new_in_process(driver));
-        Self::from_driver(
-            ComputeDriverKind::Docker.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-    }
-
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_kubernetes(
-        config: KubernetesComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        shutdown_rx: watch::Receiver<bool>,
-    ) -> Result<(Self, Option<OperatorNamespaceAllowlist>), ComputeError> {
-        let driver = KubernetesComputeDriver::new(config, shutdown_rx)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let operator_allowlist_arc = driver.operator_allowlist().cloned();
-        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new_in_process(driver));
-        let runtime = Self::from_driver(
-            ComputeDriverKind::Kubernetes.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await?;
-        Ok((runtime, operator_allowlist_arc))
-    }
-
     pub(crate) async fn new_remote_driver(
         endpoint: AcquiredRemoteDriverEndpoint,
         store: Arc<Store>,
@@ -807,32 +727,6 @@ impl ComputeRuntime {
         .await
     }
 
-    #[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-    pub async fn new_podman(
-        config: PodmanComputeConfig,
-        store: Arc<Store>,
-        sandbox_index: SandboxIndex,
-        sandbox_watch_bus: SandboxWatchBus,
-        tracing_log_bus: TracingLogBus,
-        supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new_in_process(driver));
-        Self::from_driver(
-            ComputeDriverKind::Podman.as_str().to_string(),
-            driver,
-            None,
-            store,
-            sandbox_index,
-            sandbox_watch_bus,
-            tracing_log_bus,
-            supervisor_sessions,
-        )
-        .await
-    }
-
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
@@ -844,8 +738,8 @@ impl ComputeRuntime {
     }
 
     #[must_use]
-    pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_info.name.parse().ok()
+    pub fn configured_driver_name(&self) -> &str {
+        &self.driver_info.name
     }
 
     #[must_use]
@@ -1347,10 +1241,10 @@ impl ComputeRuntime {
                 let suspension_progressing =
                     expected_stopped && driver_snapshot_confirms_stopping(&snapshot);
                 if suspension_progressing {
-                    // The Kubernetes controller has accepted the stop and
-                    // is waiting for its pod to terminate. Preserve the
-                    // durable transition so a later watch event can complete
-                    // it instead of claiming the sandbox is running again.
+                    // The backend has accepted the stop but has not finished
+                    // terminating the sandbox. Preserve the durable transition
+                    // so a later watch event can complete it instead of claiming
+                    // the sandbox is running again.
                     debug!(sandbox_id, "Sandbox stop is still progressing");
                 } else if backend_phase == SandboxPhase::Error
                     || observed_stopped == expected_stopped
@@ -4022,24 +3916,10 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
             return SandboxPhase::Deleting;
         }
 
-        // `Ready=True` means the sandbox is usable through this gateway and must
-        // win over a `Suspended=True` condition. Agent Sandbox v1beta1 sets
-        // `Suspended=True (PodTerminated)` on stop and does not clear it on resume,
-        // so a resumed CR carries both `Ready=True` and a stale `Suspended=True`.
-        // Treating any `Suspended=True` as Stopped would pin the resumed sandbox at
-        // Starting forever (issue #2932). A genuine stop leaves `Ready` unset or
-        // False, so `Suspended` still resolves to Stopped in that case.
-        let ready = status.conditions.iter().any(|condition| {
-            condition.r#type.eq_ignore_ascii_case("Ready")
+        if status.conditions.iter().any(|condition| {
+            condition.r#type.eq_ignore_ascii_case("Suspended")
                 && condition.status.eq_ignore_ascii_case("true")
-        });
-
-        if !ready
-            && status.conditions.iter().any(|condition| {
-                condition.r#type.eq_ignore_ascii_case("Suspended")
-                    && condition.status.eq_ignore_ascii_case("true")
-            })
-        {
+        }) {
             return SandboxPhase::Stopped;
         }
 
@@ -5896,8 +5776,7 @@ mod tests {
         ));
     }
 
-    /// Driver calls are a remote boundary even in-process: they reach the
-    /// Docker daemon, the Kubernetes API, or a Podman socket.
+    /// Driver calls are a remote boundary even when the driver is in-process.
     #[tokio::test]
     async fn driver_calls_export_spans_with_parents() {
         use tracing::Instrument as _;
@@ -6600,56 +6479,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.phase(), SandboxPhase::Stopped as i32);
-    }
-
-    #[tokio::test]
-    async fn resumed_v1beta1_snapshot_with_stale_suspended_reaches_ready() {
-        // Reproduces issue #2932: on Agent Sandbox v1beta1 a resumed CR reports
-        // Ready=True (DependenciesReady) alongside a stale Suspended=True
-        // (PodTerminated). Starting from the Starting phase that `start` sets, the
-        // reconciled sandbox must advance to Ready rather than being pinned at
-        // Starting by the stale Suspended condition.
-        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
-        let sandbox = sandbox_record("sb-resumed", "sandbox-resumed", SandboxPhase::Starting);
-        runtime.store.put_message(&sandbox).await.unwrap();
-        register_test_supervisor_session(&runtime, sandbox.object_id());
-
-        let mut resumed = ready_driver_sandbox(sandbox.object_id(), sandbox.object_name());
-        resumed.status = Some(DriverSandboxStatus {
-            sandbox_name: sandbox.object_name().to_string(),
-            instance_id: format!("{}-pod", sandbox.object_name()),
-            conditions: vec![
-                DriverCondition {
-                    r#type: "Ready".to_string(),
-                    status: "True".to_string(),
-                    reason: "DependenciesReady".to_string(),
-                    message: "Sandbox is ready".to_string(),
-                    last_transition_time: String::new(),
-                },
-                DriverCondition {
-                    r#type: "Suspended".to_string(),
-                    status: "True".to_string(),
-                    reason: "PodTerminated".to_string(),
-                    message: "Pod terminated".to_string(),
-                    last_transition_time: String::new(),
-                },
-            ],
-            ..Default::default()
-        });
-
-        runtime.apply_sandbox_update(resumed).await.unwrap();
-
-        let current = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            current.phase(),
-            SandboxPhase::Ready as i32,
-            "a resumed, Ready sandbox must not stay Starting because of a stale Suspended condition"
-        );
     }
 
     #[tokio::test]
@@ -8192,7 +8021,7 @@ mod tests {
 
     #[tokio::test]
     async fn backend_not_ready_with_supervisor_becomes_ready() {
-        // VM path: supervisor connects before backend reports Ready.
+        // The supervisor may connect before the backend reports Ready.
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
