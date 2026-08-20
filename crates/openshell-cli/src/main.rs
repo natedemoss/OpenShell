@@ -1800,6 +1800,10 @@ enum SandboxTemplateCommands {
         #[arg(long, default_value_t = 0)]
         offset: u32,
 
+        /// Filter templates by labels, e.g. env=prod,team=runtime.
+        #[arg(long)]
+        label_selector: Option<String>,
+
         /// Print only template names (one per line).
         #[arg(long, conflicts_with = "output")]
         names: bool,
@@ -3464,6 +3468,7 @@ async fn run_async() -> Result<()> {
                             SandboxTemplateCommands::List {
                                 limit,
                                 offset,
+                                label_selector,
                                 names,
                                 output,
                                 all_workspaces,
@@ -3472,6 +3477,7 @@ async fn run_async() -> Result<()> {
                                     endpoint,
                                     limit,
                                     offset,
+                                    label_selector.as_deref(),
                                     names,
                                     output.as_str(),
                                     &cli.workspace,
@@ -5666,6 +5672,8 @@ mod tests {
             "list",
             "--names",
             "--all-workspaces",
+            "--label-selector",
+            "team=runtime",
             "--limit",
             "25",
             "--offset",
@@ -5679,6 +5687,7 @@ mod tests {
                     Some(SandboxCommands::Template(SandboxTemplateCommands::List {
                         limit,
                         offset,
+                        label_selector,
                         names,
                         all_workspaces,
                         ..
@@ -5687,6 +5696,7 @@ mod tests {
             }) => {
                 assert_eq!(limit, 25);
                 assert_eq!(offset, 5);
+                assert_eq!(label_selector.as_deref(), Some("team=runtime"));
                 assert!(names);
                 assert!(all_workspaces);
             }
