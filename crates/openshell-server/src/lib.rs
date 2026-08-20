@@ -49,6 +49,7 @@ mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
@@ -663,7 +664,7 @@ pub(crate) async fn run_server(
             auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
         ));
         info!(
-            driver = state.compute.selected_driver_name(),
+            driver = state.compute.configured_driver_name(),
             "compute-driver sandbox bootstrap authenticator enabled"
         );
     }
@@ -1087,6 +1088,7 @@ pub struct ComputeDriverRegistration {
     detection_priority: u16,
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
+    telemetry_category: TelemetryComputeDriver,
     inherited_config_keys: &'static [&'static str],
     local_singleplayer: bool,
     supports_mtls_user_auth: bool,
@@ -1119,6 +1121,7 @@ impl ComputeDriverRegistration {
             detection_priority,
             detect,
             factory: Arc::new(factory),
+            telemetry_category: TelemetryComputeDriver::custom(),
             inherited_config_keys: &[],
             local_singleplayer: false,
             supports_mtls_user_auth: true,
@@ -1130,6 +1133,14 @@ impl ComputeDriverRegistration {
     #[must_use]
     pub fn with_inherited_config_keys(mut self, keys: &'static [&'static str]) -> Self {
         self.inherited_config_keys = keys;
+        self
+    }
+
+    /// Assign a bounded telemetry category chosen by the binary composition
+    /// boundary. Runtime driver names are never used as telemetry values.
+    #[must_use]
+    pub fn with_telemetry_category(mut self, category: TelemetryComputeDriver) -> Self {
+        self.telemetry_category = category;
         self
     }
 
@@ -1374,6 +1385,7 @@ async fn build_compute_runtime(
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
     let driver = resolve_configured_compute_driver(registry, selection.name(), driver_startup)?;
+    let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
     info!(driver = %driver.name(), "Using compute driver");
     if config
         .gateway_jwt
@@ -1455,7 +1467,7 @@ async fn build_compute_runtime(
         }
     };
 
-    Ok(runtime)
+    Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
 
 #[derive(Debug, Clone)]
@@ -1478,6 +1490,17 @@ impl ConfiguredComputeDriver {
             Self::Remote { name } => registry
                 .get(name)
                 .is_some_and(ComputeDriverRegistration::is_local_singleplayer),
+        }
+    }
+
+    fn telemetry_compute_driver(&self, registry: &ComputeDriverRegistry) -> TelemetryComputeDriver {
+        match self {
+            Self::Registered(registration) => registration.telemetry_category,
+            Self::Remote { name } => registry
+                .get(name)
+                .map_or_else(TelemetryComputeDriver::custom, |registration| {
+                    registration.telemetry_category
+                }),
         }
     }
 }
@@ -1735,7 +1758,12 @@ mod tests {
                         None,
                         TestComputeDriverFactory,
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .with_telemetry_category(
+                        openshell_core::telemetry::TelemetryComputeDriver::anonymous_category(
+                            "registered",
+                        ),
+                    ),
                 )
                 .unwrap();
         }
@@ -2168,12 +2196,14 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_registered_name() {
         let config = Config::new(None).with_compute_drivers(["beta"]);
-        let driver = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap();
+        let registry = test_compute_drivers();
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "registered"
+        );
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Registered(registration) if registration.name == "beta"
@@ -2183,13 +2213,15 @@ mod tests {
     #[test]
     fn configured_compute_driver_resolves_named_remote() {
         let config = Config::new(None).with_compute_drivers(["kyma"]);
+        let registry = test_compute_drivers();
 
-        let driver = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap();
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "custom"
+        );
 
         match driver {
             ConfiguredComputeDriver::Remote { name } => {
@@ -2209,13 +2241,15 @@ mod tests {
         let config = Config::new(None)
             .with_compute_drivers(["alpha"])
             .with_compute_driver_endpoint("alpha", "/run/openshell/alpha.sock");
+        let registry = test_compute_drivers();
 
-        let driver = configured_compute_driver(
-            &test_compute_drivers(),
-            &config,
-            test_driver_startup(&config, None),
-        )
-        .unwrap();
+        let driver =
+            configured_compute_driver(&registry, &config, test_driver_startup(&config, None))
+                .unwrap();
+        assert_eq!(
+            driver.telemetry_compute_driver(&registry).as_str(),
+            "registered"
+        );
         assert!(matches!(
             driver,
             ConfiguredComputeDriver::Remote { name } if name == "alpha"
