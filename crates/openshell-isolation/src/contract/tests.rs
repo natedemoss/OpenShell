@@ -286,7 +286,9 @@ impl IsolationBackend for WrongVersionBackend {
 
 /// A backend that opts into supervisor-owned creation. The ordinary mock
 /// backends intentionally rely on the trait's attach-only default.
-struct CreatingBackend;
+struct CreatingBackend {
+    destroyed: Arc<AtomicBool>,
+}
 
 #[async_trait]
 impl IsolationBackend for CreatingBackend {
@@ -316,6 +318,17 @@ impl IsolationBackend for CreatingBackend {
                 source: Arc::new(MockSource(PhantomData)),
             }),
         ))
+    }
+
+    async fn destroy(
+        &self,
+        descriptor: VerifiedTopologyDescriptor,
+        sandbox_id: &str,
+    ) -> Result<(), BackendError> {
+        assert_eq!(descriptor.backend_name(), self.backend_name());
+        assert_eq!(descriptor.payload(), sandbox_id.as_bytes());
+        self.destroyed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn attach(
@@ -488,8 +501,11 @@ async fn attach_only_backend_may_omit_create() {
 #[tokio::test]
 async fn create_and_attach_converge_on_the_same_lifecycle() {
     let mut reg = BackendRegistry::new();
-    reg.register(Arc::new(CreatingBackend))
-        .expect("register creating backend");
+    let destroyed = Arc::new(AtomicBool::new(false));
+    reg.register(Arc::new(CreatingBackend {
+        destroyed: destroyed.clone(),
+    }))
+    .expect("register creating backend");
 
     let (descriptor, created) = drive_create(&reg, create_plan("mock-creating"), "mock-creating")
         .await
@@ -499,13 +515,38 @@ async fn create_and_attach_converge_on_the_same_lifecycle() {
         BoundaryExitStatus::Exited(0)
     );
 
-    let attached = drive(&reg, descriptor, "mock-creating")
+    let attached = drive(&reg, descriptor.clone(), "mock-creating")
         .await
         .expect("attach lifecycle");
     assert_eq!(
         attached.agent().wait().await.expect("attached agent wait"),
         BoundaryExitStatus::Exited(0)
     );
+
+    reg.destroy_created(
+        descriptor,
+        BoundaryOrigin::SupervisorCreated,
+        "mock-creating",
+        "sb-1",
+    )
+    .await
+    .expect("destroy supervisor-created resource");
+    assert!(destroyed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn registry_never_destroys_an_externally_created_resource() {
+    let reg = registry();
+    let error = reg
+        .destroy_created(
+            descriptor("mock-primary"),
+            BoundaryOrigin::ExternallyCreated,
+            "mock-primary",
+            "sb-1",
+        )
+        .await
+        .expect_err("external lifecycle owner must retain destruction authority");
+    assert!(matches!(error, BackendError::Denied(_)));
 }
 
 #[test]

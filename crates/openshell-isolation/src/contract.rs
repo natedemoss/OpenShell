@@ -470,6 +470,34 @@ impl BackendRegistry {
             }
         }
     }
+
+    /// Destroy a resource created by the supervisor through this registry.
+    ///
+    /// Trusted durable state supplies `origin`; externally created resources
+    /// remain owned by their compute driver or orchestrator and are rejected.
+    /// Destruction is idempotent at the backend-specific resource layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Denied`] when `origin` is not
+    /// [`BoundaryOrigin::SupervisorCreated`], an envelope resolution error, or
+    /// the selected backend's destruction error.
+    pub async fn destroy_created(
+        &self,
+        descriptor: TopologyDescriptor,
+        origin: BoundaryOrigin,
+        admitted_backend_name: &str,
+        sandbox_id: &str,
+    ) -> Result<(), BackendError> {
+        if origin != BoundaryOrigin::SupervisorCreated {
+            return Err(BackendError::Denied(
+                "the supervisor cannot destroy an externally created isolation resource"
+                    .to_string(),
+            ));
+        }
+        let (backend, verified) = self.resolve(descriptor, admitted_backend_name)?;
+        backend.destroy(verified, sandbox_id).await
+    }
 }
 
 /// A fresh supervisor-created resource already bound to its admitted sandbox.
@@ -550,6 +578,22 @@ pub trait IsolationBackend: Send + Sync {
     ) -> Result<CreatedBoundary, BackendError> {
         Err(BackendError::Unsupported(format!(
             "backend {:?} does not support supervisor-owned creation",
+            self.backend_name()
+        )))
+    }
+
+    /// Destroy a resource previously returned by [`Self::create`].
+    ///
+    /// This operation is optional for attach-only backends. Implementations
+    /// must validate the descriptor against `sandbox_id` and make retries
+    /// idempotent so recovery can finish cleanup after a supervisor crash.
+    async fn destroy(
+        &self,
+        _descriptor: VerifiedTopologyDescriptor,
+        _sandbox_id: &str,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(format!(
+            "backend {:?} does not support supervisor-owned destruction",
             self.backend_name()
         )))
     }

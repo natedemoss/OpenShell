@@ -247,21 +247,45 @@ impl IsolationBackend for DockerIsolationBackend {
         Ok(CreatedBoundary::new(descriptor, Box::new(bound)))
     }
 
+    async fn destroy(
+        &self,
+        descriptor: VerifiedTopologyDescriptor,
+        sandbox_id: &str,
+    ) -> Result<(), BackendError> {
+        let topology = decode_topology(&descriptor)?;
+        validate_topology_identity(&topology, sandbox_id, &self.listener_dir)?;
+
+        let inspected = match self
+            .docker
+            .inspect_container(&topology.container_id, None)
+            .await
+        {
+            Ok(inspected) => Some(inspected),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => None,
+            Err(error) => return Err(docker_error("inspect Docker boundary for destroy", error)),
+        };
+        if let Some(inspected) = inspected {
+            validate_container_labels(
+                &inspected,
+                &topology.sandbox_id,
+                &topology.launch_generation,
+                &topology.plan_fingerprint,
+            )?;
+            remove_container(&self.docker, &topology.container_id).await?;
+        }
+        remove_listener_artifacts(&topology.listener_path)?;
+        Ok(())
+    }
+
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
         sandbox: SandboxContext,
     ) -> Result<Box<dyn BoundBoundary>, BackendError> {
-        let topology: DockerTopology =
-            serde_json::from_slice(descriptor.payload()).map_err(|error| {
-                BackendError::Descriptor(format!("decode Docker topology: {error}"))
-            })?;
-        if topology.sandbox_id != sandbox.sandbox_id {
-            return Err(BackendError::Denied(format!(
-                "Docker boundary sandbox {:?} does not match admitted sandbox {:?}",
-                topology.sandbox_id, sandbox.sandbox_id
-            )));
-        }
+        let topology = decode_topology(&descriptor)?;
+        validate_topology_identity(&topology, &sandbox.sandbox_id, &self.listener_dir)?;
         let inspected = self
             .docker
             .inspect_container(&topology.container_id, None)
@@ -381,7 +405,64 @@ fn topology_descriptor(topology: &DockerTopology) -> Result<TopologyDescriptor, 
     })
 }
 
+fn decode_topology(
+    descriptor: &VerifiedTopologyDescriptor,
+) -> Result<DockerTopology, BackendError> {
+    serde_json::from_slice(descriptor.payload())
+        .map_err(|error| BackendError::Descriptor(format!("decode Docker topology: {error}")))
+}
+
+fn validate_topology_identity(
+    topology: &DockerTopology,
+    sandbox_id: &str,
+    listener_dir: &Path,
+) -> Result<(), BackendError> {
+    if topology.sandbox_id != sandbox_id {
+        return Err(BackendError::Denied(format!(
+            "Docker boundary sandbox {:?} does not match admitted sandbox {sandbox_id:?}",
+            topology.sandbox_id
+        )));
+    }
+    let key = resource_key(&topology.sandbox_id, &topology.launch_generation);
+    let expected_name = format!("openshell-boundary-{key}");
+    let expected_listener = listener_dir.join(format!("{key}.sock"));
+    let expected_metadata_prefix = format!(
+        "openshell:{}:{}:",
+        topology.sandbox_id, topology.launch_generation
+    );
+    if topology.container_id.is_empty()
+        || topology.container_name != expected_name
+        || topology.listener_path != expected_listener
+        || !topology
+            .listener_metadata
+            .starts_with(&expected_metadata_prefix)
+        || topology.listener_metadata.len()
+            < expected_metadata_prefix.len() + MIN_LISTENER_TOKEN_BYTES
+    {
+        return Err(BackendError::Denied(
+            "Docker topology identity does not match its trusted resource key".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_existing_container(
+    inspected: &bollard::models::ContainerInspectResponse,
+    sandbox_id: &str,
+    launch_generation: &str,
+    plan_fingerprint: &str,
+) -> Result<(), BackendError> {
+    validate_container_labels(inspected, sandbox_id, launch_generation, plan_fingerprint)?;
+    let status = inspected.state.as_ref().and_then(|state| state.status);
+    if status != Some(ContainerStateStatusEnum::CREATED) {
+        return Err(BackendError::Denied(format!(
+            "Docker create/attach prototype requires a non-running container, found {status:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_container_labels(
     inspected: &bollard::models::ContainerInspectResponse,
     sandbox_id: &str,
     launch_generation: &str,
@@ -401,11 +482,42 @@ fn validate_existing_container(
             "existing Docker boundary does not match sandbox launch generation".to_string(),
         ));
     }
-    let status = inspected.state.as_ref().and_then(|state| state.status);
-    if status != Some(ContainerStateStatusEnum::CREATED) {
-        return Err(BackendError::Denied(format!(
-            "Docker create/attach prototype requires a non-running container, found {status:?}"
-        )));
+    Ok(())
+}
+
+async fn remove_container(docker: &Docker, container_id: &str) -> Result<(), BackendError> {
+    if let Err(error) = docker
+        .remove_container(
+            container_id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await
+        && !matches!(
+            error,
+            BollardError::DockerResponseServerError {
+                status_code: 404,
+                ..
+            }
+        )
+    {
+        return Err(docker_error("remove Docker boundary", error));
+    }
+    Ok(())
+}
+
+fn remove_listener_artifacts(listener_path: &Path) -> Result<(), BackendError> {
+    for path in [
+        listener_path.to_path_buf(),
+        listener_path.with_extension("lock"),
+    ] {
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(BackendError::Attach(format!(
+                "remove Docker listener artifact {}: {error}",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -665,24 +777,7 @@ impl BoundaryProcess for DockerProcess {
     }
 
     async fn terminate(&self) -> Result<(), BackendError> {
-        if let Err(error) = self
-            .docker
-            .remove_container(
-                &self.container_id,
-                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-            )
-            .await
-            && !matches!(
-                error,
-                BollardError::DockerResponseServerError {
-                    status_code: 404,
-                    ..
-                }
-            )
-        {
-            return Err(docker_error("remove Docker boundary", error));
-        }
-        Ok(())
+        remove_container(&self.docker, &self.container_id).await
     }
 }
 
@@ -991,6 +1086,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn topology_identity_pins_cleanup_to_the_backend_listener_directory() {
+        let listener_dir = tempfile::tempdir().expect("listener tempdir");
+        let key = resource_key("sandbox-1", "generation-1");
+        let topology = DockerTopology {
+            sandbox_id: "sandbox-1".to_string(),
+            launch_generation: "generation-1".to_string(),
+            container_id: "container-id".to_string(),
+            container_name: format!("openshell-boundary-{key}"),
+            listener_path: listener_dir.path().join(format!("{key}.sock")),
+            listener_metadata: format!(
+                "openshell:sandbox-1:generation-1:{}",
+                "0".repeat(MIN_LISTENER_TOKEN_BYTES)
+            ),
+            plan_fingerprint: "fingerprint".to_string(),
+        };
+        validate_topology_identity(&topology, "sandbox-1", listener_dir.path())
+            .expect("matching topology");
+
+        let mut escaped = topology;
+        escaped.listener_path = listener_dir.path().join("../outside.sock");
+        assert!(validate_topology_identity(&escaped, "sandbox-1", listener_dir.path()).is_err());
+    }
+
     #[tokio::test]
     #[ignore = "requires a local Linux Docker daemon, runc seccomp-notify support, and a pre-pulled image"]
     async fn local_docker_denies_notified_uname_without_in_container_supervisor() {
@@ -1033,6 +1152,11 @@ mod tests {
             .expect("uname should not remain blocked")
             .expect("observe uname exit");
         assert!(matches!(status, BoundaryExitStatus::Exited(code) if code != 0));
-        process.terminate().await.expect("remove Docker boundary");
+        drop(process);
+        drop(running);
+        registry
+            .destroy_created(descriptor, origin, BACKEND_NAME, "sandbox-1")
+            .await
+            .expect("destroy supervisor-created Docker boundary");
     }
 }

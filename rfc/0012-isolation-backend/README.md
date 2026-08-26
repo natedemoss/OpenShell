@@ -183,6 +183,14 @@ trait IsolationBackend: Send + Sync {
         Err(BackendError::Unsupported(...))
     }
 
+    async fn destroy(
+        &self,
+        descriptor: VerifiedTopologyDescriptor,
+        sandbox_id: &SandboxId,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(...))
+    }
+
     async fn attach(
         &self,
         descriptor: VerifiedTopologyDescriptor,
@@ -362,6 +370,8 @@ Failures resolve as follows:
 
 Whenever a boundary ends, the backend terminates remaining workload processes and releases the active-boundary binding before the lifecycle owner reclaims or deprovisions the topology. A supervisor-created resource is destroyed through the backend; an externally created resource is destroyed by its compute driver or orchestrator. If normal cleanup is unavailable, the topology's trusted reconciler terminates the execution environment and invalidates the binding before reclaim or reuse. On normal agent exit, `BoundaryProcess::wait` returns the stable exit status. A retained `wait` result may outlive teardown.
 
+`BackendRegistry::destroy_created` verifies the recovery descriptor, requires the trusted durable origin to be `SupervisorCreated`, and invokes the selected backend's idempotent `destroy` operation. It rejects `ExternallyCreated` resources without calling the backend. The backend revalidates the descriptor against the admitted sandbox identity before deleting anything. Attach-only backends may leave `destroy` unsupported because their compute driver or orchestrator retains deletion authority.
+
 ### Topologies
 
 The contract fixes the roles; a topology fixes their placement. Components may be co-located with the workload or hosted in trusted services, and one component may implement multiple roles. Every arrangement admitted to this contract preserves the same lifecycle, interfaces, and invariants. Actual containment depends on the workload's kernel relationship to the trusted components. The non-normative [topology matrix](./topology-matrix.md) catalogs representative placements.
@@ -370,7 +380,7 @@ The contract fixes the roles; a topology fixes their placement. Components may b
 
 This RFC defines the contract; implementation lands in four phases:
 
-1. **Contract.** Add the common types, descriptor handling, optional creation, registry, and explicit provisioning-route selection from deployment configuration.
+1. **Contract.** Add the common types, descriptor handling, optional creation and destruction, registry, and explicit provisioning-route selection from deployment configuration.
 2. **Co-located and attachment backends.** Implement attachment for externally provisioned topologies and route agent launch, egress interception, the network-mediation source, SSH, `exec`, and forwarding through the common lifecycle.
 3. **Supervisor-created proof.** Extract reusable host-supervisor orchestration, let a compute-driver binary inject a create-capable backend, and validate Docker create-before-start plus OCI seccomp listener-FD delivery. The proof remains non-conformant until it implements every mandatory runtime surface.
 4. **Conformance and enablement.** Require every topology admitted to the RFC 0012 lifecycle to pass tests for the six contract invariants plus envelope verification, lifecycle ordering, runtime operations, ownership-aware cleanup, and failure semantics.
@@ -425,7 +435,6 @@ That would make known deployments explicit, but it would also encode current top
 
 ## Open questions
 
-- Should backend-owned destruction be a method over a verified recovery descriptor or an ownership handle retained across typestate transitions?
 - Which creation inputs should become typed common fields instead of remaining in the backend-private payload?
 - Where should the durable resource-origin record be committed so a crash cannot lose supervisor-owned cleanup responsibility?
 
