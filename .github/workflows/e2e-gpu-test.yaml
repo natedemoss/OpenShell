@@ -12,6 +12,11 @@ on:
         required: false
         type: string
         default: ""
+      conformance-artifact-prefix:
+        description: "Optional prebuilt conformance CLI artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
       gateway-artifact-prefix:
         description: "Optional prebuilt gateway artifact prefix (artifact suffix is linux-<arch>)"
         required: false
@@ -74,6 +79,7 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact-prefix != ''

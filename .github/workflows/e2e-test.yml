@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ""
+      conformance-artifact-prefix:
+        description: "Optional prebuilt conformance CLI artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
       gateway-artifact-prefix:
         description: "Optional prebuilt gateway artifact prefix (artifact suffix is linux-<arch>)"
         required: false
@@ -57,7 +62,7 @@ jobs:
             cmd: "mise run --no-deps --skip-deps e2e:oidc-pkce:docker"
             apt_packages: "openssh-client"
           - suite: rust-docker
-            cmd: "mise run --no-deps --skip-deps e2e:rust"
+            cmd: "mise run --no-deps --skip-deps e2e:docker"
             apt_packages: "openssh-client"
           - suite: rust-docker-external-driver
             cmd: "env -u OPENSHELL_GATEWAY_BIN mise run --no-deps --skip-deps e2e:docker:external-driver"
@@ -93,6 +98,7 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact-prefix != ''
@@ -183,6 +189,7 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact-prefix != ''
@@ -340,6 +347,7 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - name: Use prebuilt OpenShell gateway
         if: inputs.gateway-artifact-prefix != ''

@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, supervisor, cli)"
+        description: "Component to build (gateway, supervisor, cli, conformance)"
         required: true
         type: string
       timeout-minutes:
@@ -101,6 +101,12 @@ jobs:
             cli)
               binary_component=cli
               binary_name=openshell
+              features=""
+              has_image=false
+              ;;
+            conformance)
+              binary_component=conformance
+              binary_name=openshell-conformance
               features=""
               has_image=false
               ;;

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: Rust Image Binary Build (openshell-gateway / openshell-sandbox / openshell-cli)
+name: Rust Image Binary Build (openshell-gateway / openshell-sandbox / openshell-cli / openshell-conformance)
 
 # Build Rust binaries per Linux architecture before the Docker image build
 # consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
@@ -18,7 +18,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Binary component to build (gateway, sandbox, or cli)"
+        description: "Binary component to build (gateway, sandbox, cli, or conformance)"
         required: true
         type: string
       arch:
@@ -142,6 +142,11 @@ jobs:
               binary=openshell
               zig_target=
               ;;
+            conformance)
+              crate=openshell-conformance-cli
+              binary=openshell-conformance
+              zig_target=
+              ;;
             *)
               echo "unsupported component: $COMPONENT" >&2
               exit 1
@@ -169,7 +174,7 @@ jobs:
               if [[ "$COMPONENT" == "sandbox" && "$static_libc" == "gnu" ]]; then
                 target=x86_64-unknown-linux-gnu
                 zig_target=
-              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
+              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" || "$COMPONENT" == "conformance" ]]; then
                 target=x86_64-unknown-linux-musl
                 zig_target=x86_64-linux-musl
               else
@@ -181,7 +186,7 @@ jobs:
               if [[ "$COMPONENT" == "sandbox" && "$static_libc" == "gnu" ]]; then
                 target=aarch64-unknown-linux-gnu
                 zig_target=
-              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" ]]; then
+              elif [[ "$COMPONENT" == "sandbox" || "$COMPONENT" == "cli" || "$COMPONENT" == "conformance" ]]; then
                 target=aarch64-unknown-linux-musl
                 zig_target=aarch64-linux-musl
               else
@@ -309,9 +314,13 @@ jobs:
         run: |
           set -euo pipefail
           BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
-          OUTPUT="$("$BIN" --version)"
-          echo "$OUTPUT"
-          grep -q "^${{ steps.target.outputs.binary }} " <<<"$OUTPUT"
+          if [[ "${{ inputs.component }}" == "conformance" ]]; then
+            "$BIN" list --output json >/dev/null
+          else
+            OUTPUT="$("$BIN" --version)"
+            echo "$OUTPUT"
+            grep -q "^${{ steps.target.outputs.binary }} " <<<"$OUTPUT"
+          fi
           # Record linkage so image runtime drift is visible in logs.
           ldd --version
           ldd "$BIN" || true
