@@ -877,7 +877,7 @@ mod tests {
     use super::*;
     use openshell_core::policy::SandboxPolicy;
     use openshell_isolation::AgentSpec;
-    use openshell_isolation::contract::BackendRegistry;
+    use openshell_isolation::contract::{BackendRegistry, BoundaryOrigin, BoundaryProvisioning};
     use uuid::Uuid;
 
     fn context() -> SandboxContext {
@@ -1014,15 +1014,17 @@ mod tests {
         create.image = image;
         create.launch_generation = Uuid::new_v4().to_string();
         let envelope = create.into_boundary_plan().expect("encode create plan");
-        let (backend, verified) = registry
-            .resolve_create(envelope, BACKEND_NAME)
-            .expect("resolve Docker create backend");
-        let created = backend
-            .create(verified, context())
+        let provisioned = registry
+            .provision(
+                BoundaryProvisioning::Create(envelope),
+                BACKEND_NAME,
+                context(),
+            )
             .await
             .expect("create stopped Docker boundary");
-        let (descriptor, bound) = created.into_parts();
+        let (descriptor, origin, bound) = provisioned.into_parts();
         assert_eq!(descriptor.backend_name, BACKEND_NAME);
+        assert_eq!(origin, BoundaryOrigin::SupervisorCreated);
         let ready = bound.confirm().await.expect("confirm Docker boundary");
         let running = ready.start_agent().await.expect("start Docker boundary");
         let process = running.agent();
