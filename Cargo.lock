@@ -3402,6 +3402,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,6 +3582,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3942,12 +3952,16 @@ dependencies = [
 name = "openshell-driver-docker"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "bollard",
  "bytes",
  "clap",
  "futures",
+ "libc",
  "miette",
+ "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation",
  "openshell-otel",
  "openshell-otel-test-support",
  "opentelemetry",
@@ -3955,6 +3969,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "temp-env",
  "tempfile",
@@ -3966,6 +3981,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

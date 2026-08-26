@@ -284,6 +284,52 @@ impl IsolationBackend for WrongVersionBackend {
     }
 }
 
+/// A backend that opts into supervisor-owned creation. The ordinary mock
+/// backends intentionally rely on the trait's attach-only default.
+struct CreatingBackend;
+
+#[async_trait]
+impl IsolationBackend for CreatingBackend {
+    fn backend_name(&self) -> &'static str {
+        "mock-creating"
+    }
+
+    fn version(&self) -> u32 {
+        INTERFACE_VERSION
+    }
+
+    async fn create(
+        &self,
+        plan: VerifiedBoundaryCreatePlan,
+        sandbox: SandboxContext,
+    ) -> Result<CreatedBoundary, BackendError> {
+        assert_eq!(plan.backend_name(), self.backend_name());
+        assert_eq!(plan.payload(), b"prepared-inputs");
+        let descriptor = TopologyDescriptor {
+            version: INTERFACE_VERSION,
+            backend_name: self.backend_name().to_string(),
+            payload: sandbox.sandbox_id.into_bytes(),
+        };
+        Ok(CreatedBoundary::new(
+            descriptor,
+            Box::new(MockBound::<Primary> {
+                source: Arc::new(MockSource(PhantomData)),
+            }),
+        ))
+    }
+
+    async fn attach(
+        &self,
+        descriptor: VerifiedTopologyDescriptor,
+        _sandbox: SandboxContext,
+    ) -> Result<Box<dyn BoundBoundary>, BackendError> {
+        assert_eq!(descriptor.backend_name(), self.backend_name());
+        Ok(Box::new(MockBound::<Primary> {
+            source: Arc::new(MockSource(PhantomData)),
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
@@ -302,6 +348,14 @@ fn descriptor(backend_name: &str) -> TopologyDescriptor {
         version: INTERFACE_VERSION,
         backend_name: backend_name.to_string(),
         payload: vec![],
+    }
+}
+
+fn create_plan(backend_name: &str) -> BoundaryCreatePlan {
+    BoundaryCreatePlan {
+        version: INTERFACE_VERSION,
+        backend_name: backend_name.to_string(),
+        payload: b"prepared-inputs".to_vec(),
     }
 }
 
@@ -332,13 +386,36 @@ async fn drive(
     descriptor: TopologyDescriptor,
     admitted: &str,
 ) -> Result<Box<dyn RunningBoundary>, BackendError> {
-    let (backend, verified) = reg.resolve(descriptor, admitted)?;
-    let bound = backend.attach(verified, sandbox_ctx()).await?;
+    let provisioned = reg
+        .provision(
+            BoundaryProvisioning::Attach(descriptor),
+            admitted,
+            sandbox_ctx(),
+        )
+        .await?;
+    let (_descriptor, origin, bound) = provisioned.into_parts();
+    assert_eq!(origin, BoundaryOrigin::ExternallyCreated);
     // The mediation source is retained before consuming `Bound` and stays
     // usable across the confirm/start transitions.
     let _ingress = bound.network_mediation_source();
     let ready = bound.confirm().await?;
     ready.start_agent().await
+}
+
+async fn drive_create(
+    reg: &BackendRegistry,
+    plan: BoundaryCreatePlan,
+    admitted: &str,
+) -> Result<(TopologyDescriptor, Box<dyn RunningBoundary>), BackendError> {
+    let provisioned = reg
+        .provision(BoundaryProvisioning::Create(plan), admitted, sandbox_ctx())
+        .await?;
+    let (descriptor, origin, bound) = provisioned.into_parts();
+    assert_eq!(origin, BoundaryOrigin::SupervisorCreated);
+    let _ingress = bound.network_mediation_source();
+    let ready = bound.confirm().await?;
+    let running = ready.start_agent().await?;
+    Ok((descriptor, running))
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +459,53 @@ fn registry_rejects_unknown_backend() {
         .map(|_| ())
         .expect_err("unknown must fail");
     assert!(matches!(err, BackendError::NotRegistered(_)));
+}
+
+#[test]
+fn registry_rejects_create_plan_for_wrong_admitted_backend() {
+    let reg = registry();
+    let err = reg
+        .resolve_create(create_plan("mock-primary"), "mock-secondary")
+        .err()
+        .expect("mismatched create plan must fail");
+    assert!(matches!(err, BackendError::Descriptor(_)));
+}
+
+#[tokio::test]
+async fn attach_only_backend_may_omit_create() {
+    let reg = registry();
+    let (backend, verified) = reg
+        .resolve_create(create_plan("mock-primary"), "mock-primary")
+        .expect("resolve attach-only backend");
+    let err = backend
+        .create(verified, sandbox_ctx())
+        .await
+        .err()
+        .expect("create must be unsupported");
+    assert!(matches!(err, BackendError::Unsupported(_)));
+}
+
+#[tokio::test]
+async fn create_and_attach_converge_on_the_same_lifecycle() {
+    let mut reg = BackendRegistry::new();
+    reg.register(Arc::new(CreatingBackend))
+        .expect("register creating backend");
+
+    let (descriptor, created) = drive_create(&reg, create_plan("mock-creating"), "mock-creating")
+        .await
+        .expect("create lifecycle");
+    assert_eq!(
+        created.agent().wait().await.expect("created agent wait"),
+        BoundaryExitStatus::Exited(0)
+    );
+
+    let attached = drive(&reg, descriptor, "mock-creating")
+        .await
+        .expect("attach lifecycle");
+    assert_eq!(
+        attached.agent().wait().await.expect("attached agent wait"),
+        BoundaryExitStatus::Exited(0)
+    );
 }
 
 #[test]
@@ -699,6 +823,10 @@ fn error_kinds_map_to_supervisor_status_classes() {
     );
     assert_eq!(
         BackendError::Unavailable("x".into()).kind(),
+        BackendErrorKind::Unavailable
+    );
+    assert_eq!(
+        BackendError::Unsupported("x".into()).kind(),
         BackendErrorKind::Unavailable
     );
     assert_eq!(

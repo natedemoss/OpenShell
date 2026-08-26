@@ -367,9 +367,6 @@ pub async fn run_sandbox(
         registry
             .register(backend)
             .map_err(|error| miette::miette!(error.to_string()))?;
-        let (backend, verified) = registry
-            .resolve(descriptor, &admitted_backend_name)
-            .map_err(|error| miette::miette!(error.to_string()))?;
         let context = openshell_isolation::contract::SandboxContext {
             sandbox_id: sandbox_id.clone().unwrap_or_default(),
             policy: policy.clone(),
@@ -381,11 +378,16 @@ pub async fn run_sandbox(
                 interactive,
             },
         };
-        let bound = backend
-            .attach(verified, context)
+        let provisioned = registry
+            .provision(
+                openshell_isolation::contract::BoundaryProvisioning::Attach(descriptor),
+                &admitted_backend_name,
+                context,
+            )
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
-        info!(backend = %admitted_backend_name, "Isolation boundary attached");
+        let (_recovery_descriptor, origin, bound) = provisioned.into_parts();
+        info!(backend = %admitted_backend_name, ?origin, "Isolation boundary provisioned");
         let network_mediation_source = bound.network_mediation_source();
         let mediation_bind_ip = *proxy_bind_ip.lock().expect("proxy bind IP lock");
         let networking = openshell_supervisor_network::run::run_networking(

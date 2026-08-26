@@ -18,12 +18,13 @@
 //!
 //! # Ordering is a security property
 //!
-//! The lifecycle states run in order: attach -> Bound -> confirm -> Ready ->
-//! `start_agent` -> Running. Nothing untrusted runs inside the boundary until it
-//! is confirmed ready. This is enforced *by construction*: each transition
-//! consumes the prior state by value, and no state type has a public
-//! constructor, so the supervisor cannot skip a stage or run a workload before
-//! [`contract::ReadyBoundary`] exists.
+//! The lifecycle states run in order: either create or attach -> Bound ->
+//! confirm -> Ready -> `start_agent` -> Running. Creation is optional; a
+//! distributed topology can remain compute-driver-provisioned and attach-only.
+//! Nothing untrusted runs inside the boundary until it is confirmed ready. This
+//! is enforced *by construction*: each transition consumes the prior state by
+//! value, and no state type has a public constructor, so the supervisor cannot
+//! skip a stage or run a workload before [`contract::ReadyBoundary`] exists.
 //!
 //! [`AgentSpec`] is shared between the workload definition the supervisor
 //! submits and the [`contract::SandboxContext`] that `attach` binds to a

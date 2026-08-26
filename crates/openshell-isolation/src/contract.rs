@@ -10,8 +10,10 @@
 //! chain of boxed states:
 //!
 //! ```text
+//! create plan + sandbox context -> Bound -> confirm -> Ready
+//!                                  -> start_agent -> Running
 //! attach topology + sandbox context -> Bound -> confirm -> Ready
-//!     -> start_agent -> Running
+//!                                  -> start_agent -> Running
 //! ```
 //!
 //! Each transition consumes the prior state by value (`self: Box<Self>`), and no
@@ -20,10 +22,11 @@
 //! registry is the only lookup by `backend_name`, and everything past it is a
 //! `Box<dyn _>` / `Arc<dyn _>`.
 //!
-//! `attach` is atomic from the caller's perspective: it returns `Bound` or fails
-//! closed, and it never binds a resource that is already bound to an active
-//! boundary. Binary identity travels on every [`MediatedConnection`], resolved
-//! by the backend for that exact connection; an unresolved identity denies the
+//! `create` and `attach` are atomic from the caller's perspective: either route
+//! returns `Bound` or fails closed. Creation is optional and never falls back;
+//! attachment never binds a resource already bound to an active boundary.
+//! Binary identity travels on every [`MediatedConnection`], resolved by the
+//! backend for that exact connection; an unresolved identity denies the
 //! connection and never authorizes anything.
 //!
 //! The contract is transport-neutral. Concrete topology implementations keep
@@ -62,6 +65,8 @@ pub enum BackendError {
     Denied(String),
     /// Boundary temporarily unavailable.
     Unavailable(String),
+    /// The selected backend does not implement an optional contract operation.
+    Unsupported(String),
     /// Attachment-phase failure (establishment or mediation bring-up).
     Attach(String),
     /// Readiness confirmation failed (do not start workload code).
@@ -98,7 +103,7 @@ impl BackendError {
         match self {
             Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
             Self::Denied(_) => BackendErrorKind::Denied,
-            Self::Unavailable(_) => BackendErrorKind::Unavailable,
+            Self::Unavailable(_) | Self::Unsupported(_) => BackendErrorKind::Unavailable,
             Self::Attach(_) | Self::Confirm(_) | Self::Process(_) => BackendErrorKind::Failed,
             Self::Terminated(_) => BackendErrorKind::Terminated,
         }
@@ -112,6 +117,7 @@ impl fmt::Display for BackendError {
             Self::NotRegistered(m) => write!(f, "backend not registered: {m}"),
             Self::Denied(m) => write!(f, "attachment denied: {m}"),
             Self::Unavailable(m) => write!(f, "boundary unavailable: {m}"),
+            Self::Unsupported(m) => write!(f, "operation unsupported: {m}"),
             Self::Attach(m) => write!(f, "attachment failed: {m}"),
             Self::Confirm(m) => write!(f, "confirmation failed: {m}"),
             Self::Process(m) => write!(f, "process error: {m}"),
@@ -163,6 +169,52 @@ pub struct TopologyDescriptor {
     pub payload: Vec<u8>,
 }
 
+/// Trusted, backend-specific inputs for creating a fresh isolation boundary.
+///
+/// Unlike [`TopologyDescriptor`], this envelope describes a resource to create,
+/// not one that already exists. Trusted deployment code selects the backend and
+/// protects the opaque payload from workload modification.
+#[derive(Debug, Clone)]
+pub struct BoundaryCreatePlan {
+    /// The Isolation Backend contract version this plan targets.
+    pub version: u32,
+    /// The backend the supervisor must ask to create the boundary.
+    pub backend_name: String,
+    /// Backend-specific prepared creation inputs.
+    pub payload: Vec<u8>,
+}
+
+/// Trusted provisioning input selected before the supervisor drives a backend.
+///
+/// The variants are explicit and never used as fallback alternatives.
+#[derive(Debug, Clone)]
+pub enum BoundaryProvisioning {
+    /// Ask a create-capable backend to create a fresh resource.
+    Create(BoundaryCreatePlan),
+    /// Attach to a resource created by a compute driver or orchestrator.
+    Attach(TopologyDescriptor),
+}
+
+/// Durable resource-lifecycle ownership selected by the provisioning route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryOrigin {
+    /// The Isolation Backend created the resource at the supervisor's request.
+    SupervisorCreated,
+    /// A compute driver or external orchestrator created the resource.
+    ExternallyCreated,
+}
+
+impl BoundaryProvisioning {
+    /// Backend admitted for this provisioning route.
+    #[must_use]
+    pub fn backend_name(&self) -> &str {
+        match self {
+            Self::Create(plan) => &plan.backend_name,
+            Self::Attach(descriptor) => &descriptor.backend_name,
+        }
+    }
+}
+
 /// A descriptor whose common envelope has passed registry verification.
 ///
 /// Minted only by [`BackendRegistry::resolve`]; no public constructor, so an
@@ -171,6 +223,33 @@ pub struct TopologyDescriptor {
 /// atomically binds it to the sandbox context during `attach`.
 pub struct VerifiedTopologyDescriptor {
     descriptor: TopologyDescriptor,
+}
+
+/// A create plan whose common envelope has passed registry verification.
+///
+/// The selected backend still validates the opaque payload during `create`.
+pub struct VerifiedBoundaryCreatePlan {
+    plan: BoundaryCreatePlan,
+}
+
+impl VerifiedBoundaryCreatePlan {
+    /// The verified backend name.
+    #[must_use]
+    pub fn backend_name(&self) -> &str {
+        &self.plan.backend_name
+    }
+
+    /// The backend-specific creation payload.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.plan.payload
+    }
+
+    /// The interface version.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.plan.version
+    }
 }
 
 impl VerifiedTopologyDescriptor {
@@ -301,6 +380,150 @@ impl BackendRegistry {
         }
         Ok((backend, VerifiedTopologyDescriptor { descriptor }))
     }
+
+    /// Verify a fresh-boundary create plan and resolve its backend.
+    ///
+    /// Creation is selected explicitly by trusted orchestration. Resolution
+    /// never falls back to attachment or to another backend when creation is
+    /// unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::Descriptor`] for a version or admission
+    /// mismatch, and [`BackendError::NotRegistered`] when no backend is
+    /// registered for the admitted name.
+    pub fn resolve_create(
+        &self,
+        plan: BoundaryCreatePlan,
+        admitted_backend_name: &str,
+    ) -> Result<(Arc<dyn IsolationBackend>, VerifiedBoundaryCreatePlan), BackendError> {
+        if plan.version != INTERFACE_VERSION {
+            return Err(BackendError::Descriptor(format!(
+                "create plan interface version {} unsupported (expected {INTERFACE_VERSION})",
+                plan.version
+            )));
+        }
+        if plan.backend_name != admitted_backend_name {
+            return Err(BackendError::Descriptor(format!(
+                "create plan backend {:?} does not match admitted backend {admitted_backend_name:?}",
+                plan.backend_name
+            )));
+        }
+        let backend = self
+            .backends
+            .get(&plan.backend_name)
+            .ok_or_else(|| BackendError::NotRegistered(plan.backend_name.clone()))?
+            .clone();
+        if backend.backend_name() != plan.backend_name {
+            return Err(BackendError::Descriptor(format!(
+                "registry returned backend {:?} for name {:?}",
+                backend.backend_name(),
+                plan.backend_name
+            )));
+        }
+        if backend.version() != INTERFACE_VERSION {
+            return Err(BackendError::Descriptor(format!(
+                "backend {:?} speaks interface version {}, supervisor requires {INTERFACE_VERSION}",
+                plan.backend_name,
+                backend.version()
+            )));
+        }
+        Ok((backend, VerifiedBoundaryCreatePlan { plan }))
+    }
+
+    /// Drive the explicitly selected create or attach entry operation.
+    ///
+    /// Both routes return the same bound state plus the descriptor needed for
+    /// recovery and an origin that trusted durable state uses to assign cleanup
+    /// ownership. This method never falls back between routes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the selected route's verification or backend error without
+    /// advancing to [`BoundBoundary`] on failure.
+    pub async fn provision(
+        &self,
+        provisioning: BoundaryProvisioning,
+        admitted_backend_name: &str,
+        sandbox: SandboxContext,
+    ) -> Result<ProvisionedBoundary, BackendError> {
+        match provisioning {
+            BoundaryProvisioning::Create(plan) => {
+                let (backend, verified) = self.resolve_create(plan, admitted_backend_name)?;
+                let created = backend.create(verified, sandbox).await?;
+                let (descriptor, boundary) = created.into_parts();
+                Ok(ProvisionedBoundary::new(
+                    descriptor,
+                    BoundaryOrigin::SupervisorCreated,
+                    boundary,
+                ))
+            }
+            BoundaryProvisioning::Attach(descriptor) => {
+                let recovery_descriptor = descriptor.clone();
+                let (backend, verified) = self.resolve(descriptor, admitted_backend_name)?;
+                let boundary = backend.attach(verified, sandbox).await?;
+                Ok(ProvisionedBoundary::new(
+                    recovery_descriptor,
+                    BoundaryOrigin::ExternallyCreated,
+                    boundary,
+                ))
+            }
+        }
+    }
+}
+
+/// A fresh supervisor-created resource already bound to its admitted sandbox.
+///
+/// The descriptor is persisted for recovery through [`IsolationBackend::attach`].
+/// The boundary enters the same typestate chain as an externally created
+/// resource.
+pub struct CreatedBoundary {
+    descriptor: TopologyDescriptor,
+    boundary: Box<dyn BoundBoundary>,
+}
+
+impl CreatedBoundary {
+    /// Construct a successful create result.
+    #[must_use]
+    pub fn new(descriptor: TopologyDescriptor, boundary: Box<dyn BoundBoundary>) -> Self {
+        Self {
+            descriptor,
+            boundary,
+        }
+    }
+
+    /// Split the durable recovery descriptor from the bound runtime state.
+    #[must_use]
+    pub fn into_parts(self) -> (TopologyDescriptor, Box<dyn BoundBoundary>) {
+        (self.descriptor, self.boundary)
+    }
+}
+
+/// The common result after either provisioning route reaches `Bound`.
+pub struct ProvisionedBoundary {
+    descriptor: TopologyDescriptor,
+    origin: BoundaryOrigin,
+    boundary: Box<dyn BoundBoundary>,
+}
+
+impl ProvisionedBoundary {
+    fn new(
+        descriptor: TopologyDescriptor,
+        origin: BoundaryOrigin,
+        boundary: Box<dyn BoundBoundary>,
+    ) -> Self {
+        Self {
+            descriptor,
+            origin,
+            boundary,
+        }
+    }
+
+    /// Split the recovery data, lifecycle owner, and bound runtime state.
+    #[must_use]
+    pub fn into_parts(self) -> (TopologyDescriptor, BoundaryOrigin, Box<dyn BoundBoundary>) {
+        (self.descriptor, self.origin, self.boundary)
+    }
 }
 
 /// Establishes and operates boundaries for one admitted backend implementation.
@@ -312,6 +535,24 @@ pub trait IsolationBackend: Send + Sync {
     /// The Isolation Backend contract version this backend speaks. Matched
     /// exactly against [`INTERFACE_VERSION`]; there is no capability negotiation.
     fn version(&self) -> u32;
+
+    /// Create a fresh resource and atomically bind it to the trusted sandbox
+    /// context. This operation is optional so distributed or externally
+    /// provisioned topologies can remain attach-only.
+    ///
+    /// Trusted orchestration selects creation explicitly. An unsupported
+    /// implementation fails without falling back to [`Self::attach`] or to a
+    /// different backend.
+    async fn create(
+        &self,
+        _plan: VerifiedBoundaryCreatePlan,
+        _sandbox: SandboxContext,
+    ) -> Result<CreatedBoundary, BackendError> {
+        Err(BackendError::Unsupported(format!(
+            "backend {:?} does not support supervisor-owned creation",
+            self.backend_name()
+        )))
+    }
 
     /// Validate the opaque payload and atomically bind it to the trusted
     /// sandbox context: returns `Bound` or fails closed. Never binds a resource

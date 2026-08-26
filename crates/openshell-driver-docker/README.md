@@ -24,6 +24,36 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
+### Experimental host-supervisor creation backend
+
+The Linux-only `isolation` module is a proof of RFC 0012's optional
+supervisor-owned `create` path. It is not selected by the normal Docker compute
+driver. A host-side harness can register `DockerIsolationBackend`, pass a
+resolved image through `DockerBoundaryCreatePlan`, and drive the common
+`Bound -> Ready -> Running` lifecycle.
+
+The proof binds a private host Unix socket before Docker creates the container,
+passes OCI seccomp `listenerPath`, `listenerMetadata`, and `SCMP_ACT_NOTIFY`
+through the custom Docker seccomp profile, creates the container stopped, and
+starts it only from `ReadyBoundary::start_agent`. runc sends the listener FD
+directly to the host over `SCM_RIGHTS`; the prototype denies notified syscalls
+with `EPERM`. The workload image contains no OpenShell supervisor binary.
+
+The proof disables container networking and drops every capability. It does not
+yet implement mediated networking, binary identity, exec, port forwarding,
+running-boundary recovery, or the durable ownership record needed for complete
+cleanup. It therefore does not claim RFC 0012 conformance and does not change
+the production runtime model above.
+
+Run the ignored local-daemon smoke after pre-pulling an Alpine-compatible image:
+
+```shell
+OPENSHELL_DOCKER_POC_IMAGE=alpine:latest \
+  cargo test -p openshell-driver-docker \
+  local_docker_denies_notified_uname_without_in_container_supervisor \
+  -- --ignored --nocapture
+```
+
 ## Stop and Start
 
 Stop stops the managed container without removing it. Docker retains the

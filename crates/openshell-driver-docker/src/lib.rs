@@ -5,6 +5,8 @@
 
 #![allow(clippy::result_large_err)]
 
+#[cfg(target_os = "linux")]
+pub mod isolation;
 pub mod otel_tracing;
 
 use bollard::Docker;
