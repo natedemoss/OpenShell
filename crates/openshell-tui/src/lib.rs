@@ -2144,6 +2144,7 @@ async fn refresh_providers(app: &mut App) {
             }
         }
     }
+    app.sync_create_provider_types();
 
     app.provider_count = providers.len();
     app.provider_entries = providers
