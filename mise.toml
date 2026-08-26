@@ -61,9 +61,10 @@ _.file = [".env"]
 KUBECONFIG = "{{config_root}}/kubeconfig"
 UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 
-# Enable sccache for faster Rust builds. Its platform-default cache is
-# user-level, so all worktrees share it. Callers can still override SCCACHE_DIR.
+# Enable sccache for faster Rust builds. Use one user-level OpenShell cache
+# shared by every worktree while preserving an override from the caller.
 RUSTC_WRAPPER = "sccache"
+SCCACHE_DIR = "{{ get_env(name='SCCACHE_DIR', default=xdg_cache_home ~ '/openshell/sccache') }}"
 
 # Shared build constants (overridable via environment).
 # DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
