@@ -458,6 +458,7 @@ fn acquire_listener_lock(path: &Path) -> Result<File, BackendError> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(path)
         .map_err(|error| BackendError::Attach(format!("open Docker listener lock: {error}")))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -819,6 +820,9 @@ const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
 
+// Linux reserves IOC_SIZEBITS for the payload size. Both fixed seccomp
+// notification structs are far smaller than u32::MAX on supported targets.
+#[allow(clippy::cast_possible_truncation)]
 const fn ioctl_read_write<T>(kind: u8, number: u8) -> libc::c_ulong {
     ((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT
         | (kind as u32) << IOC_TYPESHIFT
@@ -843,7 +847,7 @@ fn deny_notifications(listener_fd: OwnedFd) {
         };
         if received != 0 {
             let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::EINTR) | Some(libc::ENOENT)) {
+            if matches!(error.raw_os_error(), Some(libc::EINTR | libc::ENOENT)) {
                 continue;
             }
             break;
@@ -969,9 +973,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("seccomp.lock");
         let guard = acquire_listener_lock(&path).expect("first listener lock");
-        let second = acquire_listener_lock(&path)
-            .err()
-            .expect("active listener must be denied");
+        let second = acquire_listener_lock(&path).expect_err("active listener must be denied");
         assert!(matches!(second, BackendError::Denied(_)));
         drop(guard);
         let _recovered_guard =
