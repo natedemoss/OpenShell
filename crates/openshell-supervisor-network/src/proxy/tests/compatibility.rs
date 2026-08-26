@@ -23,6 +23,23 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
     }
 }
 
+fn compatibility_engine() -> OpaEngine {
+    OpaEngine::from_strings(
+        include_str!("../../../data/sandbox-policy.rego"),
+        r#"
+network_policies:
+  proxy_compatibility:
+    name: proxy_compatibility
+    endpoints:
+      - host: "target.example"
+        port: 443
+    binaries:
+      - path: /**
+"#,
+    )
+    .unwrap()
+}
+
 async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
@@ -281,23 +298,26 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
 
 #[test]
 fn missing_authorized_l7_metadata_preserves_l4_only_fallback() {
+    let engine = compatibility_engine();
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_l7_route_snapshot(&decision, "target.example", 443).is_none());
+    assert!(query_l7_route_snapshot(&engine, &decision, "target.example", 443).is_none());
 }
 
 #[test]
 fn missing_authorized_tls_metadata_preserves_auto_fallback() {
+    let engine = compatibility_engine();
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
     assert_eq!(
-        query_tls_mode(&decision, "target.example", 443),
+        query_tls_mode(&engine, &decision, "target.example", 443),
         crate::l7::TlsMode::Auto
     );
 }
 
 #[test]
 fn missing_authorized_allowed_ips_preserves_empty_fallback() {
+    let engine = compatibility_engine();
     let decision = allowed_decision(EgressIntent::connect("target.example".to_string(), 443));
-    assert!(query_allowed_ips(&decision).is_empty());
+    assert!(query_allowed_ips(&engine, &decision, "target.example", 443).is_empty());
 }
 
 #[test]
@@ -549,7 +569,6 @@ network_policies:
                                     AgentProposals::default(),
                                     Arc::new(None),
                                     Arc::new(None),
-                                    None,
                                     None,
                                     None,
                                     None,

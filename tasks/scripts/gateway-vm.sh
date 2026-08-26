@@ -46,8 +46,8 @@ DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
 DRIVER_DIR="${OPENSHELL_DRIVER_DIR:-${DRIVER_DIR_DEFAULT}}"
 COMPRESSED_DIR_DEFAULT="${ROOT}/target/vm-runtime-compressed"
 COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR_DEFAULT}}"
-VM_HOST_GATEWAY_DEFAULT="${OPENSHELL_VM_HOST_GATEWAY:-host.containers.internal}"
-GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://${VM_HOST_GATEWAY_DEFAULT}:${PORT}}"
+GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-http://127.0.0.1:${PORT}}"
+ORIGINAL_ARGS=("$@")
 
 normalize_arch() {
   case "$1" in
@@ -68,6 +68,47 @@ normalize_bool() {
       exit 2
       ;;
   esac
+}
+
+configure_bindgen_include() {
+  local gcc_include
+  command -v gcc >/dev/null 2>&1 || return 0
+  gcc_include="$(gcc -print-file-name=include)"
+  [ -f "${gcc_include}/stdbool.h" ] || return 0
+  case " ${BINDGEN_EXTRA_CLANG_ARGS:-} " in
+    *" -isystem ${gcc_include} "*) ;;
+    *)
+      export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:+${BINDGEN_EXTRA_CLANG_ARGS} }-isystem ${gcc_include}"
+      ;;
+  esac
+}
+
+ensure_kvm_access() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  [ -e /dev/kvm ] || {
+    echo "ERROR: /dev/kvm does not exist; enable KVM on this host" >&2
+    exit 1
+  }
+  if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    return 0
+  fi
+
+  local kvm_group command arg
+  kvm_group="$(stat -c %G /dev/kvm)"
+  if [ "${OPENSHELL_VM_KVM_REEXEC:-0}" != "1" ] \
+      && command -v sg >/dev/null 2>&1 \
+      && [[ " $(id -nG "$(id -un)") " == *" ${kvm_group} "* ]]; then
+    echo "==> Entering the configured ${kvm_group} group for the VM gateway"
+    export OPENSHELL_VM_KVM_REEXEC=1
+    printf -v command 'exec %q' "${ROOT}/tasks/scripts/gateway-vm.sh"
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+      printf -v command '%s %q' "${command}" "${arg}"
+    done
+    exec sg "${kvm_group}" -c "${command}"
+  fi
+
+  echo "ERROR: /dev/kvm is not readable and writable; add $(id -un) to ${kvm_group} and start a new login session" >&2
+  exit 1
 }
 
 port_is_in_use() {
@@ -194,7 +235,7 @@ check_supervisor_cross_toolchain() {
   fi
   local missing=0
   if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "ERROR: cargo-zigbuild not found (required to cross-compile the guest supervisor)." >&2
+    echo "ERROR: cargo-zigbuild not found (required to cross-compile the guest process leaf)." >&2
     echo "       Install: cargo install --locked cargo-zigbuild && brew install zig" >&2
     missing=1
   fi
@@ -209,6 +250,8 @@ check_supervisor_cross_toolchain() {
 }
 
 VM_GPU="$(normalize_bool "${OPENSHELL_VM_GPU:-false}")"
+
+ensure_kvm_access
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -271,8 +314,9 @@ VM_DRIVER_STATE_DIR_DEFAULT="${OPENSHELL_VM_DRIVER_STATE_ROOT:-/tmp}/openshell-v
 VM_DRIVER_STATE_DIR="${OPENSHELL_VM_DRIVER_STATE_DIR:-${VM_DRIVER_STATE_DIR_DEFAULT}}"
 
 DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
+configure_bindgen_include
 
-# Build prerequisites: VM runtime artifacts + bundled supervisor.
+# Build prerequisites: VM runtime artifacts + portable guest process leaf.
 if [ ! -d "${COMPRESSED_DIR}" ] \
     || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . \
     || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ] \
@@ -281,9 +325,10 @@ if [ ! -d "${COMPRESSED_DIR}" ] \
   mise run vm:setup
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ] \
+    || [ ! -f "${COMPRESSED_DIR}/openshell-runtime.tar.zst" ]; then
   check_supervisor_cross_toolchain
-  echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
+  echo "==> Building portable VM guest process leaf (mise run vm:supervisor)"
   mise run vm:supervisor
 fi
 
@@ -294,9 +339,9 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
 fi
 
-echo "==> Building openshell-gateway and openshell-driver-vm"
+echo "==> Building openshell-gateway, host supervisor, and openshell-driver-vm"
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-  -p openshell-server -p openshell-driver-vm
+  -p openshell-server -p openshell-sandbox -p openshell-driver-vm
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"

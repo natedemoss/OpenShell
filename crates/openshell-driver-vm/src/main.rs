@@ -9,7 +9,9 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_vm::otel_tracing::compute_driver_rpc_layer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+use openshell_driver_vm::{
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -166,6 +168,12 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_gateway_port: Option<u16>,
+
+    #[arg(long, hide = true)]
+    vm_vsock_control_port: Option<u32>,
+
+    #[arg(long, hide = true)]
+    vm_vsock_control_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -551,6 +559,23 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         vsock_cid: args.vm_vsock_cid,
         guest_mac: args.vm_guest_mac.clone(),
         gateway_port: args.vm_gateway_port,
+        vsock_port_map: match (
+            args.vm_vsock_control_port,
+            args.vm_vsock_control_socket.clone(),
+        ) {
+            (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
+                guest_port,
+                host_socket,
+                host_initiated: true,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "--vm-vsock-control-port and --vm-vsock-control-socket must be set together"
+                        .to_string(),
+                );
+            }
+        },
     })
 }
 

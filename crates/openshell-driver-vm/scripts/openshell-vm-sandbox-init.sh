@@ -4,8 +4,7 @@
 
 # Minimal init for sandbox VMs. Runs as PID 1 inside the guest, mounts the
 # essential filesystems, configures networking (gvproxy DHCP or TAP static),
-# optionally loads NVIDIA GPU drivers, then execs the OpenShell sandbox
-# supervisor.
+# optionally loads NVIDIA GPU drivers, then execs the portable VM process leaf.
 
 set -euo pipefail
 
@@ -117,6 +116,10 @@ ensure_target_runtime() {
         cp /opt/openshell/bin/openshell-sandbox "$image_root/opt/openshell/bin/openshell-sandbox"
         chmod 0755 "$image_root/opt/openshell/bin/openshell-sandbox"
     fi
+    if [ -d /opt/openshell/bin/openshell-runtime ]; then
+        rm -rf "$image_root/opt/openshell/bin/openshell-runtime"
+        cp -a /opt/openshell/bin/openshell-runtime "$image_root/opt/openshell/bin/openshell-runtime"
+    fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
     if ! grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
@@ -214,14 +217,17 @@ exec_supervisor_in_newroot() {
                 "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
                 if [ -x "/newroot${loader}" ]; then
                     lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" --workdir /sandbox
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" \
+                        vm-guest /etc/openshell/vm-guest.json
                 fi
             done
-            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox
+            exec "$chroot_bin" /newroot "$supervisor" \
+                vm-guest /etc/openshell/vm-guest.json
         fi
 
         if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox \
+                vm-guest /etc/openshell/vm-guest.json
         fi
     done
 
@@ -292,65 +298,9 @@ setup_overlay_root() {
     run_post_overlay_setup
 }
 
-parse_endpoint() {
-    local endpoint="$1"
-    local scheme rest authority path host port
-
-    case "$endpoint" in
-        *://*)
-            scheme="${endpoint%%://*}"
-            rest="${endpoint#*://}"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    authority="${rest%%/*}"
-    path="${rest#"$authority"}"
-    if [ "$path" = "$rest" ]; then
-        path=""
-    fi
-
-    if [[ "$authority" =~ ^\[([^]]+)\]:(.+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
-    elif [[ "$authority" =~ ^\[([^]]+)\]$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port=""
-    elif [[ "$authority" == *:* ]]; then
-        host="${authority%%:*}"
-        port="${authority##*:}"
-    else
-        host="$authority"
-        port=""
-    fi
-
-    if [ -z "$port" ]; then
-        case "$scheme" in
-            https) port="443" ;;
-            *) port="80" ;;
-        esac
-    fi
-
-    printf '%s\n%s\n%s\n%s\n' "$scheme" "$host" "$port" "$path"
-}
-
-tcp_probe() {
-    local host="$1"
-    local port="$2"
-
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 2 bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
-    else
-        bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
-    fi
-}
-
 ensure_host_gateway_aliases() {
-    # Seed /etc/hosts with the well-known gvproxy hostnames so the supervisor
-    # can reach the OpenShell server even when gvproxy's built-in DNS is not
-    # in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
+    # Seed /etc/hosts with the well-known gvproxy hostnames for workload
+    # compatibility even when gvproxy's built-in DNS is not in resolv.conf.
     #
     # Critical distinction: host.* aliases point at the gvproxy *host-loopback*
     # IP (192.168.127.254), not the gateway IP (192.168.127.1). Only the
@@ -397,63 +347,6 @@ write_host_gateway_aliases() {
         return 1
     fi
     rm -f "$hosts_tmp"
-}
-
-rewrite_openshell_endpoint_if_needed() {
-    local endpoint="${OPENSHELL_ENDPOINT:-}"
-    [ -n "$endpoint" ] || return 0
-
-    local parsed
-    if ! parsed="$(parse_endpoint "$endpoint")"; then
-        ts "WARNING: could not parse OPENSHELL_ENDPOINT=$endpoint"
-        return 0
-    fi
-
-    local scheme host port path
-    scheme="$(printf '%s\n' "$parsed" | sed -n '1p')"
-    host="$(printf '%s\n' "$parsed" | sed -n '2p')"
-    port="$(printf '%s\n' "$parsed" | sed -n '3p')"
-    path="$(printf '%s\n' "$parsed" | sed -n '4p')"
-
-    if tcp_probe "$host" "$port"; then
-        return 0
-    fi
-
-    # Probe candidates in preference order. Hostnames first for informative
-    # log output, then a bare IP as a final safety net. In gvproxy mode the
-    # bare IP is the host-loopback (192.168.127.254). In TAP/GPU mode it's
-    # the TAP host gateway.
-    local fallback_ip="$GVPROXY_HOST_LOOPBACK_IP"
-    if [ "${GATEWAY_IP}" != "${GVPROXY_GATEWAY_IP}" ]; then
-        fallback_ip="$GATEWAY_IP"
-    fi
-    local candidates="host.openshell.internal host.containers.internal host.docker.internal"
-    if [ "$scheme" != "https" ]; then
-        candidates="${candidates} ${fallback_ip}"
-    fi
-
-    for candidate in $candidates; do
-        if [ "$candidate" = "$host" ]; then
-            continue
-        fi
-        if tcp_probe "$candidate" "$port"; then
-            local authority="$candidate"
-            if ! { [ "$scheme" = "http" ] && [ "$port" = "80" ]; } \
-                && ! { [ "$scheme" = "https" ] && [ "$port" = "443" ]; }; then
-                authority="${authority}:${port}"
-            fi
-            export OPENSHELL_ENDPOINT="${scheme}://${authority}${path}"
-            ts "rewrote OPENSHELL_ENDPOINT to ${OPENSHELL_ENDPOINT}"
-            return 0
-        fi
-    done
-
-    if [ "$scheme" = "https" ]; then
-        ts "WARNING: could not preflight HTTPS OpenShell endpoint ${host}:${port}; preserving hostname for TLS verification"
-        return 0
-    fi
-
-    ts "WARNING: could not reach OpenShell endpoint ${host}:${port}"
 }
 
 create_gpu_device_nodes_mknod() {
@@ -813,31 +706,16 @@ fi
 
 run_openshell_init_dropins
 
-rewrite_openshell_endpoint_if_needed
-
-# Log supervisor connectivity state for debugging stuck-in-Provisioning issues
-if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
-    _ep_parsed="$(parse_endpoint "$OPENSHELL_ENDPOINT" 2>/dev/null || true)"
-    if [ -n "$_ep_parsed" ]; then
-        _ep_host="$(printf '%s\n' "$_ep_parsed" | sed -n '2p')"
-        _ep_port="$(printf '%s\n' "$_ep_parsed" | sed -n '3p')"
-        if tcp_probe "$_ep_host" "$_ep_port"; then
-            ts "gateway reachable at ${_ep_host}:${_ep_port}"
-        else
-            ts "WARNING: gateway NOT reachable at ${_ep_host}:${_ep_port} — supervisor may fail to connect"
-        fi
-    fi
-    ts "OPENSHELL_ENDPOINT=${OPENSHELL_ENDPOINT}"
-fi
 if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
     ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"
 fi
 
-ts "starting openshell-sandbox supervisor"
+ts "starting OpenShell VM process leaf"
 if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
     exec_supervisor_in_newroot
 fi
-exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+exec /opt/openshell/bin/openshell-sandbox \
+    vm-guest /etc/openshell/vm-guest.json
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then

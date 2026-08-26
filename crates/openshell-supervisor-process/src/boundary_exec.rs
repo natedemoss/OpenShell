@@ -74,9 +74,7 @@ impl LocalBoundaryExec {
         }
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
-        let effective_workdir = spec.workdir.as_deref().or(self.base_workdir.as_deref());
-        let (session_user, session_home) =
-            crate::process::session_user_and_home(&self.policy, effective_workdir);
+        let (session_user, session_home) = crate::ssh::session_user_and_home(&self.policy);
         crate::ssh::apply_child_env(
             &mut command,
             &session_home,
@@ -136,7 +134,8 @@ impl LocalBoundaryExec {
             self.enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared,
-        );
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         let mut child = command
@@ -238,7 +237,8 @@ impl LocalBoundaryExec {
             self.enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared,
-        );
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))?;
         #[cfg(target_os = "linux")]
         let mut child_registry = crate::managed_children::lock();
         let mut child = command

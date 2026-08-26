@@ -17,7 +17,7 @@ OpenShell builds these main artifacts:
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
-| VM driver/runtime assets | `crates/openshell-driver-vm` |
+| VM driver/runtime assets | `crates/openshell-driver-vm` plus shared transport in `crates/openshell-isolation-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
 Sandbox community images are built outside this repository.
@@ -173,6 +173,16 @@ Runtime layout:
   enforcement. The VM driver bundles its own supervisor build
   (`tasks/scripts/vm/build-supervisor-bundle.sh`) and does not read
   `SUPERVISOR_LIBC`.
+  before publishing artifacts. On Linux, the driver can materialize the
+  same-target embedded `openshell-sandbox` as its native host supervisor. The
+  macOS VM-driver archive includes a native `openshell-sandbox` sibling because
+  the embedded guest leaf is a Linux binary.
+- **Supervisor**: Alpine base with `nftables`, static musl binary at
+  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
+  is mounted or extracted into sandbox environments. The VM bundle build also
+  packages the Linux process leaf and a driver-controlled network-helper
+  runtime into the guest bootstrap while the logical VM supervisor runs
+  natively on the host.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

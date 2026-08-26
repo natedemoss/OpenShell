@@ -19,6 +19,6 @@ pub use lifecycle::{
     RestoreContext,
 };
 pub use runtime::{
-    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
+    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, VsockPortMap, cleanup_stale_tap_interfaces,
     configured_runtime_dir, run_vm,
 };

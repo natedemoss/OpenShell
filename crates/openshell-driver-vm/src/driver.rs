@@ -1,19 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(unsafe_code)]
+
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
+
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
+#[cfg(target_os = "linux")]
+use crate::rootfs::extract_host_supervisor;
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
     extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    sandbox_guest_runtime_identity, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
+use base64::Engine as _;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
@@ -53,11 +59,14 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
+use openshell_isolation::contract::INTERFACE_VERSION;
+use openshell_isolation_vm::{GuestConfig, VmTopology, VmTransport};
 use openshell_vfio::SysfsRoot;
 use opentelemetry::trace::TraceContextExt as _;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -146,13 +155,25 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 ///
 /// Both names ultimately route through the gvproxy NAT path on
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
+#[allow(dead_code)]
 const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
+#[allow(dead_code)]
 const GUEST_SSH_SOCKET_PATH: &str = openshell_core::container_paths::SSH_SOCKET_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_CA_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CA_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_CERT_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_CERT_PATH;
+#[allow(dead_code)]
 const GUEST_TLS_KEY_PATH: &str = openshell_core::container_paths::VM_GUEST_TLS_KEY_PATH;
+#[allow(dead_code)]
 const GUEST_SANDBOX_TOKEN_PATH: &str = openshell_core::container_paths::VM_GUEST_SANDBOX_TOKEN_PATH;
 const GUEST_INIT_DROPIN_DIR: &str = openshell_core::container_paths::VM_GUEST_INIT_DROPIN_DIR;
+const GUEST_BOUNDARY_CONFIG_PATH: &str = "/etc/openshell/vm-guest.json";
+const HOST_SANDBOX_TOKEN_FILE: &str = "sandbox.jwt";
+#[cfg(target_os = "linux")]
+const HOST_SUPERVISOR_BINARY: &str = "host-runtime/openshell-sandbox";
+const VM_CONTROL_SOCKET: &str = "control.sock";
+const VM_CONTROL_PORT: u32 = 5500;
 /// Guest path of the driver-authored manifest enumerating which
 /// `init.d` drop-ins the guest init script is allowed to execute.
 ///
@@ -176,7 +197,7 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v3";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v4";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
@@ -320,7 +341,7 @@ impl VmDriverConfig {
         if provided.iter().all(Option::is_none) {
             return if self.requires_tls_materials() {
                 Err(
-                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so sandbox VMs can authenticate to the gateway"
+                    "https:// openshell endpoint requires OPENSHELL_VM_TLS_CA, OPENSHELL_VM_TLS_CERT, and OPENSHELL_VM_TLS_KEY so the host supervisor can authenticate to the gateway"
                         .to_string(),
                 )
             } else {
@@ -382,6 +403,7 @@ fn validate_openshell_endpoint(endpoint: &str) -> Result<(), String> {
 #[derive(Debug)]
 struct VmProcess {
     child: Child,
+    supervisor: Child,
     deleting: bool,
 }
 
@@ -515,6 +537,157 @@ impl VmDriver {
         };
         driver.restore_persisted_sandboxes().await;
         Ok(driver)
+    }
+
+    async fn host_supervisor_binary(&self) -> Result<PathBuf, Status> {
+        if let Some(configured) = std::env::var_os("OPENSHELL_VM_SUPERVISOR_BIN") {
+            let configured = PathBuf::from(configured);
+            if configured.is_file() {
+                return Ok(configured);
+            }
+            return Err(Status::failed_precondition(format!(
+                "configured host supervisor does not exist: {}",
+                configured.display()
+            )));
+        }
+
+        if let Some(parent) = self.launcher_bin.parent() {
+            let sibling = parent.join("openshell-sandbox");
+            if sibling.is_file() {
+                return Ok(sibling);
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(Status::failed_precondition(
+                "the native host supervisor is missing; install openshell-sandbox beside openshell-driver-vm or set OPENSHELL_VM_SUPERVISOR_BIN",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let destination = self.config.state_dir.join(HOST_SUPERVISOR_BINARY);
+            if destination.is_file() {
+                return Ok(destination);
+            }
+            let _cache_guard = self.image_cache_lock.lock().await;
+            if destination.is_file() {
+                return Ok(destination);
+            }
+            let destination_for_extract = destination.clone();
+            tokio::task::spawn_blocking(move || extract_host_supervisor(&destination_for_extract))
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("host supervisor extraction panicked: {error}"))
+                })?
+                .map_err(Status::failed_precondition)?;
+            Ok(destination)
+        }
+    }
+
+    async fn spawn_host_supervisor(
+        &self,
+        sandbox: &Sandbox,
+        state_dir: &Path,
+        tls_paths: Option<&VmDriverTlsPaths>,
+        topology: &VmTopology,
+    ) -> Result<Child, Status> {
+        let supervisor_binary = self.host_supervisor_binary().await?;
+        let token = sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.sandbox_token.as_str())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| Status::failed_precondition("VM sandbox gateway token is required"))?;
+        let token_path = state_dir.join(HOST_SANDBOX_TOKEN_FILE);
+        tokio::fs::write(&token_path, format!("{token}\n"))
+            .await
+            .map_err(|error| Status::internal(format!("write host sandbox token: {error}")))?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|error| Status::internal(format!("restrict host sandbox token: {error}")))?;
+
+        let payload = topology
+            .encode()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let sandbox_user_id = self.config.resolve_sandbox_uid();
+        let primary_group_id = self.config.resolve_sandbox_gid(sandbox_user_id);
+        let mut command = Command::new(&supervisor_binary);
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                fs::File::create(state_dir.join("supervisor.log"))
+                    .map_err(|error| Status::internal(format!("create supervisor log: {error}")))?,
+            ))
+            .stderr(Stdio::from(
+                fs::File::create(state_dir.join("supervisor.err.log")).map_err(|error| {
+                    Status::internal(format!("create supervisor error log: {error}"))
+                })?,
+            ))
+            .arg("--topology-backend-name=vm")
+            .arg(format!("--topology-version={INTERFACE_VERSION}"))
+            .arg(format!(
+                "--topology-payload-base64={}",
+                base64::engine::general_purpose::STANDARD.encode(payload)
+            ))
+            .arg("--workdir")
+            .arg("/sandbox")
+            .arg("--")
+            .args(["/bin/sh", "-lc", "while :; do sleep 3600; done"])
+            .env(
+                openshell_core::sandbox_env::ENDPOINT,
+                &self.config.openshell_endpoint,
+            )
+            .env(openshell_core::sandbox_env::SANDBOX_ID, &sandbox.id)
+            .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
+            .env(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE, &token_path)
+            .env(
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                state_dir.join("ssh.sock"),
+            )
+            .env(
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                state_dir.join("proxy-tls"),
+            )
+            .env(
+                openshell_core::sandbox_env::SANDBOX_UID,
+                sandbox_user_id.to_string(),
+            )
+            .env(
+                openshell_core::sandbox_env::SANDBOX_GID,
+                primary_group_id.to_string(),
+            )
+            .env(openshell_core::sandbox_env::OCI_IMAGE_USER, "")
+            .env(
+                openshell_core::sandbox_env::LOG_LEVEL,
+                openshell_core::driver_utils::sandbox_log_level(sandbox, &self.config.log_level),
+            )
+            .env(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                openshell_core::telemetry::enabled_env_value(),
+            );
+        if let Some(tls) = tls_paths {
+            command
+                .env(openshell_core::sandbox_env::TLS_CA, &tls.ca)
+                .env(openshell_core::sandbox_env::TLS_CERT, &tls.cert)
+                .env(openshell_core::sandbox_env::TLS_KEY, &tls.key);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(|| {
+                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            });
+        }
+        command.spawn().map_err(|error| {
+            Status::internal(format!(
+                "start host supervisor '{}': {error}",
+                supervisor_binary.display()
+            ))
+        })
     }
 
     #[must_use]
@@ -745,6 +918,7 @@ impl VmDriver {
         let root_disk = image_plan.root_disk;
         let image_disk = image_plan.image_disk;
         let overlay_disk = disk_paths.overlay_disk;
+        let bootstrap_token = random_boundary_token();
 
         self.publish_platform_event(
             sandbox.id.clone(),
@@ -756,16 +930,7 @@ impl VmDriver {
             ),
         );
         if let Err(err) = self
-            .prepare_runtime_overlay(
-                &overlay_disk,
-                tls_paths.as_ref(),
-                sandbox
-                    .spec
-                    .as_ref()
-                    .map(|spec| spec.sandbox_token.as_str())
-                    .filter(|token| !token.is_empty()),
-                overlay_preparation,
-            )
+            .prepare_runtime_overlay(&overlay_disk, overlay_preparation)
             .await
         {
             return Err(Status::internal(format!(
@@ -773,6 +938,23 @@ impl VmDriver {
             )));
         }
         self.ensure_provisioning_active(&sandbox.id).await?;
+
+        let guest_config = GuestConfig {
+            boundary_id: sandbox.id.clone(),
+            bootstrap_token: bootstrap_token.clone(),
+            control_port: VM_CONTROL_PORT,
+            agent_uid: self.config.resolve_sandbox_uid(),
+            agent_gid: self
+                .config
+                .resolve_sandbox_gid(self.config.resolve_sandbox_uid()),
+            trusted_runtime_root: PathBuf::from(
+                "/.openshell-bootstrap/opt/openshell/bin/openshell-runtime",
+            ),
+            child_env: merged_environment(&sandbox),
+        };
+        inject_guest_boundary_config(&overlay_disk, &guest_config).map_err(|error| {
+            Status::internal(format!("inject VM guest boundary configuration: {error}"))
+        })?;
 
         if let Err(err) =
             write_sandbox_image_metadata(&state_dir, &image_ref, &image_identity).await
@@ -906,15 +1088,24 @@ impl VmDriver {
             return Err(err);
         }
 
-        let endpoint_override = if plan.backend == VmBackend::Qemu {
-            plan.host_ip.as_deref().map(|host_ip| {
-                guest_visible_openshell_endpoint_for_tap(&self.config.openshell_endpoint, host_ip)
-            })
-        } else {
-            None
-        };
-
         let console_output = state_dir.join("rootfs-console.log");
+        let control_socket = state_dir.join(VM_CONTROL_SOCKET);
+        let topology = VmTopology {
+            boundary_id: sandbox.id.clone(),
+            transport: if plan.backend == VmBackend::Qemu {
+                VmTransport::HostVsock {
+                    guest_cid: plan.vsock_cid.ok_or_else(|| {
+                        Status::internal("QEMU launch plan is missing a guest vsock CID")
+                    })?,
+                    control_port: VM_CONTROL_PORT,
+                }
+            } else {
+                VmTransport::MappedUnix {
+                    socket_path: control_socket.clone(),
+                }
+            },
+            bootstrap_token,
+        };
         let mut command = Command::new(&self.launcher_bin);
         command.kill_on_drop(true);
         command.stdin(Stdio::null());
@@ -958,6 +1149,13 @@ impl VmDriver {
             if let Some(port) = plan.gateway_port {
                 command.arg("--vm-gateway-port").arg(port.to_string());
             }
+        } else {
+            let _ = tokio::fs::remove_file(&control_socket).await;
+            command
+                .arg("--vm-vsock-control-port")
+                .arg(VM_CONTROL_PORT.to_string())
+                .arg("--vm-vsock-control-socket")
+                .arg(&control_socket);
         }
 
         self.ensure_provisioning_active(&sandbox.id).await?;
@@ -966,7 +1164,7 @@ impl VmDriver {
             .arg("--vm-krun-log-level")
             .arg(self.config.krun_log_level.to_string());
 
-        for env in build_guest_environment(&sandbox, &self.config, endpoint_override.as_deref()) {
+        for env in build_guest_environment(&sandbox, &self.config) {
             command.arg("--vm-env").arg(env);
         }
         for env in &plan.env {
@@ -979,7 +1177,7 @@ impl VmDriver {
             console_output = %console_output.display(),
             "vm driver: spawning VM launcher"
         );
-        let child = match spawn_vm_launcher(&mut command, &sandbox.id, &plan.backend) {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 warn!(
@@ -1006,8 +1204,27 @@ impl VmDriver {
             launcher_pid = child.id().unwrap_or(0),
                 "vm driver: launcher spawned"
         );
+        let supervisor = match self
+            .spawn_host_supervisor(&sandbox, &state_dir, tls_paths.as_ref(), &topology)
+            .await
+        {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                let _ = terminate_vm_process(&mut child).await;
+                self.lifecycle_extensions
+                    .after_launch_failed(
+                        &sandbox,
+                        &state_dir,
+                        LaunchAbortReason::LauncherSpawnFailed,
+                    )
+                    .await;
+                self.release_gpu_and_subnet(&sandbox.id);
+                return Err(error);
+            }
+        };
         let process = Arc::new(Mutex::new(VmProcess {
             child,
+            supervisor,
             deleting: false,
         }));
 
@@ -1032,6 +1249,9 @@ impl VmDriver {
             {
                 let mut process = process.lock().await;
                 process.deleting = true;
+                terminate_vm_process(&mut process.supervisor)
+                    .await
+                    .map_err(|err| Status::internal(format!("failed to stop supervisor: {err}")))?;
                 terminate_vm_process(&mut process.child)
                     .await
                     .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
@@ -1261,6 +1481,9 @@ impl VmDriver {
         if let Some(process) = process {
             let mut process = process.lock().await;
             process.deleting = true;
+            terminate_vm_process(&mut process.supervisor)
+                .await
+                .map_err(|err| Status::internal(format!("failed to stop supervisor: {err}")))?;
             terminate_vm_process(&mut process.child)
                 .await
                 .map_err(|err| Status::internal(format!("failed to stop vm: {err}")))?;
@@ -1711,7 +1934,7 @@ impl VmDriver {
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         ));
-        plan.gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
+        plan.gateway_port = None;
         Ok(())
     }
 
@@ -1843,8 +2066,6 @@ impl VmDriver {
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
         let tap = tap_device_name(sandbox_id);
-        let gateway_port = gateway_port_from_endpoint(&self.config.openshell_endpoint);
-
         let (vcpus, mem_mib) = if is_gpu {
             (self.config.gpu_vcpus, self.config.gpu_mem_mib)
         } else {
@@ -1865,7 +2086,7 @@ impl VmDriver {
             host_ip: Some(subnet.host_ip.to_string()),
             vsock_cid: Some(vsock_cid),
             guest_mac: Some(mac_str),
-            gateway_port,
+            gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
         })
@@ -2041,16 +2262,9 @@ impl VmDriver {
     async fn prepare_runtime_overlay(
         &self,
         overlay_disk: &Path,
-        tls_paths: Option<&VmDriverTlsPaths>,
-        sandbox_token: Option<&str>,
         preparation: OverlayPreparation,
     ) -> Result<(), String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        let tls_materials = match tls_paths {
-            Some(paths) => Some(read_guest_tls_materials(paths).await?),
-            None => None,
-        };
-        let sandbox_token = sandbox_token.map(str::to_string);
         let overlay_disk = overlay_disk.to_path_buf();
         let overlay_size_bytes = self
             .config
@@ -2078,8 +2292,6 @@ impl VmDriver {
             prepare_sandbox_overlay_image(
                 &template_path,
                 &overlay_disk,
-                tls_materials.as_ref(),
-                sandbox_token.as_deref(),
                 preparation,
                 overlay_size_bytes,
             )
@@ -3166,39 +3378,48 @@ impl VmDriver {
                 process.clone()
             };
 
-            let exit_status = {
+            let poll_result = {
                 let mut process = process.lock().await;
                 if process.deleting {
                     return;
                 }
                 match process.child.try_wait() {
-                    Ok(status) => status,
-                    Err(err) => {
-                        if let Some(snapshot) = self
-                            .set_snapshot_condition(
-                                &sandbox_id,
-                                error_condition("ProcessPollFailed", &err.to_string()),
-                                false,
-                            )
-                            .await
-                        {
-                            self.publish_snapshot(snapshot);
-                        }
-                        self.publish_platform_event(
-                            sandbox_id.clone(),
-                            platform_event(
-                                "vm",
-                                "Warning",
-                                "ProcessPollFailed",
-                                format!("Failed to poll VM helper process: {err}"),
-                            ),
-                        );
-                        return;
-                    }
+                    Ok(Some(status)) => Ok(Some(("VM", status))),
+                    Ok(None) => process
+                        .supervisor
+                        .try_wait()
+                        .map(|status| status.map(|status| ("host supervisor", status))),
+                    Err(error) => Err(error),
                 }
             };
 
-            if let Some(status) = exit_status {
+            let exit_status = match poll_result {
+                Ok(status) => status,
+                Err(err) => {
+                    if let Some(snapshot) = self
+                        .set_snapshot_condition(
+                            &sandbox_id,
+                            error_condition("ProcessPollFailed", &err.to_string()),
+                            false,
+                        )
+                        .await
+                    {
+                        self.publish_snapshot(snapshot);
+                    }
+                    self.publish_platform_event(
+                        sandbox_id.clone(),
+                        platform_event(
+                            "vm",
+                            "Warning",
+                            "ProcessPollFailed",
+                            format!("Failed to poll VM sandbox process: {err}"),
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            if let Some((component, status)) = exit_status {
                 let state_dir = {
                     let registry = self.registry.lock().await;
                     registry
@@ -3218,9 +3439,17 @@ impl VmDriver {
                         "vm driver: failed to persist canonical-process exit tombstone"
                     );
                 }
+                {
+                    let mut process = process.lock().await;
+                    if component == "VM" {
+                        let _ = terminate_vm_process(&mut process.supervisor).await;
+                    } else {
+                        let _ = terminate_vm_process(&mut process.child).await;
+                    }
+                }
                 let message = status.code().map_or_else(
-                    || "VM process exited".to_string(),
-                    |code| format!("VM process exited with status {code}"),
+                    || format!("{component} process exited"),
+                    |code| format!("{component} process exited with status {code}"),
                 );
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
@@ -4383,46 +4612,12 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-/// Rewrites loopback host references in a gateway URL to a hostname the guest
-/// can reach via gvproxy.
-///
-/// The driver receives the gateway endpoint from `--openshell-endpoint`, which
-/// in local/dev/e2e setups is typically `http://127.0.0.1:<port>`. That URL is
-/// useless inside the guest because the guest's loopback interface is its own,
-/// not the host's. Inside the guest we need a name that gvproxy will translate
-/// into the host's loopback address.
-///
-/// We rewrite to `host.openshell.internal`, which gvproxy's embedded DNS resolves
-/// to the host-loopback IP `192.168.127.254`. gvproxy installs a default NAT entry
-/// rewriting that destination to the host's `127.0.0.1` and dialing out from the
-/// host process, so any port the host is listening on becomes reachable. The
-/// gateway IP `192.168.127.1` does **not** do this — it only listens on gvproxy's
-/// own service ports (DNS, DHCP, HTTP API). The guest init script also seeds the
-/// hostname in `/etc/hosts` so resolution works even if gvproxy's DNS isn't in
-/// resolv.conf (e.g. when DHCP fails).
-///
-/// Non-loopback URLs are returned unchanged.
-fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-
-    let should_rewrite = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-
-    if should_rewrite && url.set_host(Some(GVPROXY_HOST_LOOPBACK_ALIAS)).is_ok() {
-        return url.to_string();
+fn random_boundary_token() -> String {
+    let mut token = String::with_capacity(64);
+    for byte in rand::random::<[u8; 32]>() {
+        write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-
-    endpoint.to_string()
-}
-
-fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
-    Url::parse(endpoint).ok().and_then(|url| url.port())
+    token
 }
 
 fn has_complete_qemu_network(plan: &LaunchPlan) -> bool {
@@ -4433,50 +4628,17 @@ fn has_complete_qemu_network(plan: &LaunchPlan) -> bool {
         && plan.guest_mac.is_some()
 }
 
-fn guest_visible_openshell_endpoint_for_tap(endpoint: &str, host_ip: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-    if url.set_host(Some(host_ip)).is_ok() {
-        url.to_string()
-    } else {
-        endpoint.to_string()
-    }
-}
-
-fn build_guest_environment(
-    sandbox: &Sandbox,
-    config: &VmDriverConfig,
-    endpoint_override: Option<&str>,
-) -> Vec<String> {
-    let openshell_endpoint = endpoint_override.map_or_else(
-        || guest_visible_openshell_endpoint(&config.openshell_endpoint),
-        String::from,
-    );
-    // 1. User-supplied environment (lowest priority).
-    let user_env = merged_environment(sandbox);
+fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
+    // The guest receives only driver-owned boot metadata. Gateway credentials,
+    // TLS material, and logical-supervisor configuration remain on the host;
+    // workload environment is carried in the authenticated GuestConfig.
     let mut environment: HashMap<String, String> = HashMap::new();
-    environment.extend(user_env.clone());
-    if !user_env.is_empty()
-        && let Ok(json) = serde_json::to_string(&user_env)
-    {
-        environment.insert(
-            openshell_core::sandbox_env::USER_ENVIRONMENT.to_string(),
-            json,
-        );
-    }
-
-    // 2. Required driver vars (highest priority -- always overwrite).
     environment.insert("HOME".to_string(), "/root".to_string());
     environment.insert(
         "PATH".to_string(),
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
     );
     environment.insert("TERM".to_string(), "xterm".to_string());
-    environment.insert(
-        openshell_core::sandbox_env::ENDPOINT.to_string(),
-        openshell_endpoint,
-    );
     environment.insert(
         openshell_core::sandbox_env::SANDBOX_ID.to_string(),
         sandbox.id.clone(),
@@ -4486,67 +4648,13 @@ fn build_guest_environment(
         sandbox.name.clone(),
     );
     environment.insert(
-        openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
-        GUEST_SSH_SOCKET_PATH.to_string(),
-    );
-    // The libkrun guest environment path does not preserve spaces in values
-    // before guest startup. Use a whitespace-free base64url envelope so
-    // command arguments remain lossless.
-    let main_process =
-        openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec_base64url(
-            sandbox.spec.as_ref(),
-        )
-        .expect("main process config serialization cannot fail");
-    environment.insert(
-        openshell_core::sandbox_env::MAIN_PROCESS_SPEC.to_string(),
-        main_process,
-    );
-    environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
     );
-    if config.requires_tls_materials() {
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CA.to_string(),
-            GUEST_TLS_CA_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_CERT.to_string(),
-            GUEST_TLS_CERT_PATH.to_string(),
-        );
-        environment.insert(
-            openshell_core::sandbox_env::TLS_KEY.to_string(),
-            GUEST_TLS_KEY_PATH.to_string(),
-        );
-    }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
-    // Runtime capabilities are driver-owned. The VM driver does not yet
-    // provide policy DNS and transparent TCP interception.
-    environment.insert(
-        openshell_core::sandbox_env::NETWORK_RUNTIME_CAPABILITIES.to_string(),
-        String::new(),
-    );
-    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
-    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    // Prevent user-supplied environment from overriding the TLS server name
-    // the supervisor verifies — a sandbox user who can redirect the gateway
-    // hostname could otherwise present a certificate for a name they control
-    // and intercept the sandbox JWT.
-    environment.remove(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
-    if sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| !spec.sandbox_token.is_empty())
-    {
-        environment.insert(
-            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
-            GUEST_SANDBOX_TOKEN_PATH.to_string(),
-        );
-    }
-
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs
@@ -4754,8 +4862,9 @@ fn write_oci_layout_for_manifest(
 
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
     format!(
-        "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
-        openshell_core::VERSION
+        "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:guest-{}:{image_identity}",
+        openshell_core::VERSION,
+        sandbox_guest_runtime_identity()
     )
 }
 
@@ -4874,26 +4983,6 @@ fn validate_restored_sandbox_state(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct GuestTlsMaterials {
-    ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
-}
-
-async fn read_guest_tls_materials(paths: &VmDriverTlsPaths) -> Result<GuestTlsMaterials, String> {
-    let ca = tokio::fs::read(&paths.ca)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.ca.display()))?;
-    let cert = tokio::fs::read(&paths.cert)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.cert.display()))?;
-    let key = tokio::fs::read(&paths.key)
-        .await
-        .map_err(|err| format!("read {}: {err}", paths.key.display()))?;
-    Ok(GuestTlsMaterials { ca, cert, key })
-}
-
 async fn overlay_template_image_ready(path: &Path, size_bytes: u64) -> Result<bool, String> {
     match tokio::fs::metadata(path).await {
         Ok(metadata) => Ok(metadata.is_file() && metadata.len() == size_bytes),
@@ -4978,36 +5067,19 @@ fn create_empty_sandbox_overlay_image(overlay_disk: &Path, size_bytes: u64) -> R
 fn create_sandbox_overlay_image_from_template(
     template_path: &Path,
     overlay_disk: &Path,
-    tls_materials: Option<&GuestTlsMaterials>,
-    sandbox_token: Option<&str>,
 ) -> Result<(), String> {
-    clone_or_copy_sparse_file(template_path, overlay_disk)?;
-    if let Some(tls) = tls_materials {
-        inject_guest_tls_materials(overlay_disk, tls)?;
-    }
-    if let Some(token) = sandbox_token {
-        inject_guest_sandbox_token(overlay_disk, token)?;
-    }
-    Ok(())
+    clone_or_copy_sparse_file(template_path, overlay_disk)
 }
 
 fn prepare_sandbox_overlay_image(
     template_path: &Path,
     overlay_disk: &Path,
-    tls_materials: Option<&GuestTlsMaterials>,
-    sandbox_token: Option<&str>,
     preparation: OverlayPreparation,
     expected_size_bytes: u64,
 ) -> Result<(), String> {
     if preparation == OverlayPreparation::PreserveExisting {
         match fs::metadata(overlay_disk) {
             Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
-                if let Some(tls) = tls_materials {
-                    inject_guest_tls_materials(overlay_disk, tls)?;
-                }
-                if let Some(token) = sandbox_token {
-                    inject_guest_sandbox_token(overlay_disk, token)?;
-                }
                 return Ok(());
             }
             Ok(metadata) if metadata.is_file() => {
@@ -5034,37 +5106,15 @@ fn prepare_sandbox_overlay_image(
         }
     }
 
-    create_sandbox_overlay_image_from_template(
-        template_path,
-        overlay_disk,
-        tls_materials,
-        sandbox_token,
-    )
+    create_sandbox_overlay_image_from_template(template_path, overlay_disk)
 }
 
-fn inject_guest_tls_materials(
-    overlay_disk: &Path,
-    materials: &GuestTlsMaterials,
-) -> Result<(), String> {
-    write_rootfs_image_file(
-        overlay_disk,
-        &overlay_upper_path(GUEST_TLS_CA_PATH),
-        &materials.ca,
-    )?;
-    write_rootfs_image_file(
-        overlay_disk,
-        &overlay_upper_path(GUEST_TLS_CERT_PATH),
-        &materials.cert,
-    )?;
-    let key_path = overlay_upper_path(GUEST_TLS_KEY_PATH);
-    write_rootfs_image_file(overlay_disk, &key_path, &materials.key)?;
-    set_rootfs_image_file_mode(overlay_disk, &key_path, 0o600)
-}
-
-fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), String> {
-    let token_path = overlay_upper_path(GUEST_SANDBOX_TOKEN_PATH);
-    write_rootfs_image_file(overlay_disk, &token_path, format!("{token}\n").as_bytes())?;
-    set_rootfs_image_file_mode(overlay_disk, &token_path, 0o600)
+fn inject_guest_boundary_config(overlay_disk: &Path, config: &GuestConfig) -> Result<(), String> {
+    let config = serde_json::to_vec(config)
+        .map_err(|error| format!("encode VM guest boundary configuration: {error}"))?;
+    let config_path = overlay_upper_path(GUEST_BOUNDARY_CONFIG_PATH);
+    write_rootfs_image_file(overlay_disk, &config_path, &config)?;
+    set_rootfs_image_file_mode(overlay_disk, &config_path, 0o600)
 }
 
 #[allow(clippy::result_large_err)]
@@ -5311,47 +5361,6 @@ fn dir_size_bytes(path: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
-#[cfg(test)]
-fn stage_guest_tls_materials(
-    staging_dir: &Path,
-    materials: &GuestTlsMaterials,
-) -> Result<(), String> {
-    let tls_dir = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
-        .parent()
-        .ok_or_else(|| "guest TLS CA path has no parent".to_string())?
-        .to_path_buf();
-    fs::create_dir_all(&tls_dir)
-        .map_err(|err| format!("create guest TLS dir {}: {err}", tls_dir.display()))?;
-
-    let ca_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CA_PATH.trim_start_matches('/'));
-    let cert_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'));
-    let key_path = staging_dir
-        .join("upper")
-        .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
-    fs::write(&ca_path, &materials.ca)
-        .map_err(|err| format!("write guest TLS CA {}: {err}", ca_path.display()))?;
-    fs::write(&cert_path, &materials.cert)
-        .map_err(|err| format!("write guest TLS cert {}: {err}", cert_path.display()))?;
-    fs::write(&key_path, &materials.key)
-        .map_err(|err| format!("write guest TLS key {}: {err}", key_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("chmod guest TLS key {}: {err}", key_path.display()))?;
-    }
-
-    Ok(())
-}
-
 fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     let parent = overlay_disk.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(
@@ -5391,6 +5400,7 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
         vm.backend = ?backend,
     )
 )]
+#[allow(dead_code)]
 fn spawn_vm_launcher(
     command: &mut Command,
     sandbox_id: &str,
@@ -6048,7 +6058,7 @@ mod tests {
         let parent = tracing::info_span!("vm.provision");
 
         let result = driver
-            .prepare_runtime_overlay(Path::new("/unused"), None, None, OverlayPreparation::Fresh)
+            .prepare_runtime_overlay(Path::new("/unused"), OverlayPreparation::Fresh)
             .instrument(parent)
             .await;
         assert!(result.is_err(), "overflow should stop before disk I/O");
@@ -6780,8 +6790,6 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
-            None,
-            None,
             OverlayPreparation::PreserveExisting,
             "saved-overlay".len() as u64,
         )
@@ -6803,8 +6811,6 @@ mod tests {
         prepare_sandbox_overlay_image(
             &template,
             &overlay,
-            None,
-            None,
             OverlayPreparation::PreserveExisting,
             "fresh-overlay".len() as u64,
         )
@@ -6818,8 +6824,8 @@ mod tests {
     #[test]
     fn overlay_upper_path_targets_overlay_upperdir() {
         assert_eq!(
-            overlay_upper_path(GUEST_TLS_KEY_PATH),
-            "/upper/opt/openshell/tls/tls.key"
+            overlay_upper_path(GUEST_BOUNDARY_CONFIG_PATH),
+            "/upper/etc/openshell/vm-guest.json"
         );
     }
 
@@ -7033,7 +7039,7 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_sets_supervisor_defaults() {
+    fn build_guest_environment_sets_process_leaf_boot_metadata() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
@@ -7045,16 +7051,18 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
         assert!(env.contains(&"HOME=/root".to_string()));
-        assert!(env.contains(&format!(
-            "OPENSHELL_ENDPOINT=http://{GVPROXY_HOST_LOOPBACK_ALIAS}:8080/"
-        )));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX=breezy-rhinoceros".to_string()));
-        assert!(env.contains(&format!(
-            "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
-        )));
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_ENDPOINT="))
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSHELL_SSH_SOCKET_PATH="))
+        );
     }
 
     #[test]
@@ -7068,78 +7076,45 @@ mod tests {
     }
 
     #[test]
-    fn persisted_legacy_sandbox_without_command_uses_scratch_main() {
+    fn build_guest_environment_keeps_user_values_in_child_channel() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
         };
-        // Requests persisted before the canonical-main contract have a
-        // present DriverSandboxSpec but no command or tty fields.
         let sandbox = Sandbox {
-            id: "legacy-sandbox".to_string(),
-            name: "legacy-sandbox".to_string(),
-            spec: Some(SandboxSpec::default()),
-            ..Default::default()
-        };
-
-        let env = build_guest_environment(&sandbox, &config, None);
-        let encoded = env
-            .iter()
-            .find_map(|entry| {
-                entry.strip_prefix(&format!(
-                    "{}=",
-                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
-                ))
-            })
-            .expect("main process environment");
-        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded)
-            .expect("legacy persisted request should produce a valid main config");
-
-        assert_eq!(
-            main,
-            openshell_core::sandbox_env::MainProcessConfig::scratch()
-        );
-    }
-
-    #[test]
-    fn build_guest_environment_preserves_main_command_spaces() {
-        let config = VmDriverConfig {
-            openshell_endpoint: "https://127.0.0.1:8080".to_string(),
-            ..Default::default()
-        };
-        let command = vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "echo ready; while true; do sleep 1; done".to_string(),
-        ];
-        let sandbox = Sandbox {
-            id: "space-command".to_string(),
-            name: "space-command".to_string(),
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                command: command.clone(),
+                environment: HashMap::from([
+                    ("LD_PRELOAD".to_string(), "/workload/evil.so".to_string()),
+                    ("BAD;touch /root/pwned".to_string(), "value".to_string()),
+                ]),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
-        let encoded = env
-            .iter()
-            .find_map(|entry| {
-                entry.strip_prefix(&format!(
-                    "{}=",
-                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC
-                ))
-            })
-            .expect("main process environment");
+        let env = build_guest_environment(&sandbox, &config);
 
-        assert!(!encoded.contains(char::is_whitespace));
-        let main = openshell_core::sandbox_env::MainProcessConfig::decode(encoded).unwrap();
-        assert_eq!(main.command, command);
+        assert!(!env.iter().any(|entry| entry.starts_with("LD_PRELOAD=")));
+        assert!(!env.iter().any(|entry| entry.starts_with("BAD;")));
+        assert!(
+            !env.iter()
+                .any(|entry| { entry.starts_with(openshell_core::sandbox_env::USER_ENVIRONMENT) })
+        );
+        let child_env = merged_environment(&sandbox);
+        assert_eq!(
+            child_env.get("LD_PRELOAD"),
+            Some(&"/workload/evil.so".to_string())
+        );
+        assert_eq!(
+            child_env.get("BAD;touch /root/pwned"),
+            Some(&"value".to_string())
+        );
     }
 
     #[test]
-    fn build_guest_environment_uses_token_file_without_raw_token_env() {
+    fn build_guest_environment_excludes_all_gateway_credentials() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
             ..Default::default()
@@ -7158,16 +7133,16 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
 
         assert!(!env.iter().any(|v| v.starts_with(&format!(
             "{}=",
             openshell_core::sandbox_env::SANDBOX_TOKEN
         ))));
-        assert!(env.contains(&format!(
-            "{}={GUEST_SANDBOX_TOKEN_PATH}",
+        assert!(!env.iter().any(|v| v.starts_with(&format!(
+            "{}=",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
-        )));
+        ))));
     }
 
     #[test]
@@ -7189,7 +7164,7 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
+        let env = build_guest_environment(&sandbox, &config);
 
         assert!(
             !env.iter().any(|v| v.starts_with(&format!(
@@ -7226,7 +7201,7 @@ mod tests {
                     ..Default::default()
                 };
 
-                let env = build_guest_environment(&sandbox, &config, None);
+                let env = build_guest_environment(&sandbox, &config);
                 let telemetry_entries = env
                     .iter()
                     .filter(|entry| {
@@ -7247,6 +7222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn build_guest_environment_clears_unsupported_network_capabilities() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -7277,6 +7253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn build_guest_environment_uses_endpoint_override_for_tap() {
         let config = VmDriverConfig {
             openshell_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -7305,6 +7282,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_host_alias() {
         assert_eq!(
             guest_visible_openshell_endpoint("http://127.0.0.1:8080"),
@@ -7321,6 +7299,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn guest_visible_openshell_endpoint_preserves_non_loopback_hosts() {
         assert_eq!(
             guest_visible_openshell_endpoint(&format!(
@@ -7479,7 +7458,7 @@ mod tests {
     }
 
     #[test]
-    fn build_guest_environment_includes_tls_paths_for_https_endpoint() {
+    fn build_guest_environment_keeps_tls_paths_host_side() {
         let config = VmDriverConfig {
             openshell_endpoint: "https://127.0.0.1:8443".to_string(),
             guest_tls_ca: Some(PathBuf::from("/host/ca.crt")),
@@ -7494,10 +7473,8 @@ mod tests {
             ..Default::default()
         };
 
-        let env = build_guest_environment(&sandbox, &config, None);
-        assert!(env.contains(&format!("OPENSHELL_TLS_CA={GUEST_TLS_CA_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_CERT={GUEST_TLS_CERT_PATH}")));
-        assert!(env.contains(&format!("OPENSHELL_TLS_KEY={GUEST_TLS_KEY_PATH}")));
+        let env = build_guest_environment(&sandbox, &config);
+        assert!(!env.iter().any(|entry| entry.starts_with("OPENSHELL_TLS_")));
     }
 
     #[test]
@@ -7562,6 +7539,7 @@ mod tests {
             record.state_dir = retry_state_dir;
             record.process = Some(Arc::new(Mutex::new(VmProcess {
                 child: spawn_exited_child(),
+                supervisor: spawn_exited_child(),
                 deleting: false,
             })));
         }
@@ -7769,14 +7747,14 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
-        assert_eq!(
-            bootstrap_image_cache_identity("sha256:bootstrap-image"),
-            format!(
-                "sandbox-bootstrap-rootfs-ext4-v3:openshell-{}:sha256:bootstrap-image",
-                openshell_core::VERSION
-            )
-        );
+    fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
+        let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
+        assert!(identity.starts_with(&format!(
+            "sandbox-bootstrap-rootfs-ext4-v4:openshell-{}:guest-",
+            openshell_core::VERSION
+        )));
+        assert!(identity.ends_with(":sha256:bootstrap-image"));
+        assert!(identity.contains(&sandbox_guest_runtime_identity()));
     }
 
     #[test]
@@ -7876,66 +7854,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn read_guest_tls_materials_reports_missing_input() {
-        let base = unique_temp_dir();
-        let source_dir = base.join("missing-source");
-
-        let err = read_guest_tls_materials(&VmDriverTlsPaths {
-            ca: source_dir.join("ca.crt"),
-            cert: source_dir.join("tls.crt"),
-            key: source_dir.join("tls.key"),
-        })
-        .await
-        .expect_err("missing TLS materials should fail before image injection");
-
-        assert!(err.contains("ca.crt"));
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stage_guest_tls_materials_places_files_in_overlay_upper_with_private_key_mode() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let base = unique_temp_dir();
-        let materials = GuestTlsMaterials {
-            ca: b"ca".to_vec(),
-            cert: b"cert".to_vec(),
-            key: b"key".to_vec(),
-        };
-
-        stage_guest_tls_materials(&base, &materials).expect("stage TLS materials");
-
-        assert_eq!(
-            fs::read(
-                base.join("upper")
-                    .join(GUEST_TLS_CA_PATH.trim_start_matches('/'))
-            )
-            .unwrap(),
-            b"ca"
-        );
-        assert_eq!(
-            fs::read(
-                base.join("upper")
-                    .join(GUEST_TLS_CERT_PATH.trim_start_matches('/'))
-            )
-            .unwrap(),
-            b"cert"
-        );
-        let key_path = base
-            .join("upper")
-            .join(GUEST_TLS_KEY_PATH.trim_start_matches('/'));
-        assert_eq!(fs::read(&key_path).unwrap(), b"key");
-        assert_eq!(
-            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
     #[test]
     fn subnet_allocator_assigns_and_releases() {
         let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 0, 128, 0), 17);
@@ -8010,6 +7928,7 @@ mod tests {
         };
         let process = Arc::new(Mutex::new(VmProcess {
             child,
+            supervisor: spawn_exited_child(),
             deleting: false,
         }));
 

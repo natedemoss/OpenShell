@@ -10,6 +10,8 @@
 //! orchestrator, not here.
 
 use miette::{IntoDiagnostic, Result};
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -26,6 +28,7 @@ use crate::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_isolation::contract::{BoundaryExec, BoundaryPortForward};
 
 #[cfg(target_os = "linux")]
 use openshell_core::activity::ActivitySender;
@@ -36,44 +39,159 @@ use openshell_core::denial::DenialEvent;
 use crate::managed_children;
 use crate::process::{
     ProcessEnforcementMode, ProcessHandle, ProcessStatus, ResolvedProcessIdentity,
-    ResolvedWorkspace,
 };
-
-pub type SidecarExitReport = (
-    String,
-    i32,
-    tokio::sync::oneshot::Sender<Result<(), String>>,
-);
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
 }
 
-/// Spawn the workload entrypoint, wire up SSH and supervisor session, and
-/// wait for the entrypoint child to exit.
+/// Host-side SSH and gateway-session tasks for an already-running boundary.
+///
+/// Delegated backends start the workload themselves, but the logical
+/// supervisor still owns the user access plane. Keeping these tasks in the
+/// process-supervisor crate lets local and VM boundaries share the same SSH
+/// and `ConnectSupervisor` implementations.
+pub struct BoundaryAccess {
+    terminating: Arc<AtomicBool>,
+    ssh_task: Option<tokio::task::JoinHandle<()>>,
+    session_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for BoundaryAccess {
+    fn drop(&mut self) {
+        self.terminating.store(true, Ordering::Release);
+        if let Some(task) = self.ssh_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.session_task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Start the host-owned access plane for a delegated isolation boundary.
+///
+/// The SSH server executes commands and opens loopback connections through
+/// the boundary interfaces supplied by the driver. The persistent supervisor
+/// session then registers the sandbox with the gateway and relays requests to
+/// that local SSH endpoint.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_boundary_access(
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    ssh_socket_path: Option<&str>,
+    shared_ssh_socket: bool,
+    ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    enforcement_mode: ProcessEnforcementMode,
+    boundary_exec: Arc<dyn BoundaryExec>,
+    port_forward: Arc<dyn BoundaryPortForward>,
+) -> Result<BoundaryAccess> {
+    let terminating = Arc::new(AtomicBool::new(false));
+    let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
+        return Ok(BoundaryAccess {
+            terminating,
+            ssh_task: None,
+            session_task: None,
+        });
+    };
+
+    let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
+    let listen_path = ssh_socket_path.clone();
+    let ssh_port_forward = port_forward.clone();
+    let ssh_task = tokio::spawn(async move {
+        if let Err(err) = crate::ssh::run_ssh_server(
+            listen_path,
+            ssh_ready_tx,
+            ca_file_paths,
+            enforcement_mode,
+            shared_ssh_socket,
+            ssh_port_forward,
+            boundary_exec,
+        )
+        .await
+        {
+            ocsf_emit!(
+                AppLifecycleBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Critical)
+                    .status(StatusId::Failure)
+                    .message(format!("SSH server failed: {err}"))
+                    .build()
+            );
+        }
+    });
+
+    match timeout(Duration::from_secs(10), ssh_ready_rx).await {
+        Ok(Ok(Ok(()))) => {
+            ocsf_emit!(
+                AppLifecycleBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .message("SSH server is ready to accept connections")
+                    .build()
+            );
+        }
+        Ok(Ok(Err(err))) => {
+            ssh_task.abort();
+            return Err(err.context("SSH server failed during startup"));
+        }
+        Ok(Err(_)) => {
+            ssh_task.abort();
+            return Err(miette::miette!(
+                "SSH server task panicked before signaling ready"
+            ));
+        }
+        Err(_) => {
+            ssh_task.abort();
+            return Err(miette::miette!(
+                "SSH server did not start within 10 seconds"
+            ));
+        }
+    }
+
+    let session_task = match (openshell_endpoint, sandbox_id) {
+        (Some(endpoint), Some(id)) => Some(crate::supervisor_session::spawn(
+            endpoint.to_string(),
+            id.to_string(),
+            ssh_socket_path,
+            port_forward,
+            None,
+            Arc::clone(&terminating),
+        )),
+        _ => None,
+    };
+
+    Ok(BoundaryAccess {
+        terminating,
+        ssh_task: Some(ssh_task),
+        session_task,
+    })
+}
+
+/// Run the workload entrypoint to completion using the legacy orchestration
+/// surface. New isolation-backend callers retain the [`SpawnedAgent`] returned
+/// by [`spawn_workload`] instead.
 ///
 /// # Errors
 ///
-/// Returns an error if SSH server startup fails, if the entrypoint child
-/// fails to spawn, or if waiting for the child returns an OS error.
+/// Returns an error if the workload cannot be spawned or waited.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn run_process(
     program: &str,
     args: &[String],
-    workspace: ResolvedWorkspace,
+    workdir: Option<&str>,
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     shared_ssh_socket: bool,
-    ssh_exit_tx: Option<tokio::sync::oneshot::Sender<()>>,
     policy: &SandboxPolicy,
     resolved_process_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
-    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<(u32, String)>>,
-    sidecar_exit_tx: Option<tokio::sync::mpsc::Sender<SidecarExitReport>>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -84,6 +202,76 @@ pub async fn run_process(
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
+    let mut agent = spawn_workload(
+        program,
+        args,
+        workdir,
+        timeout_secs,
+        interactive,
+        sandbox_id,
+        openshell_endpoint,
+        ssh_socket_path,
+        shared_ssh_socket,
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        entrypoint_pid,
+        entrypoint_started_tx,
+        provider_credentials,
+        provider_env,
+        ca_file_paths,
+        agent_proposals,
+        #[cfg(target_os = "linux")]
+        netns,
+        #[cfg(target_os = "linux")]
+        bypass_denial_tx,
+        #[cfg(target_os = "linux")]
+        bypass_activity_tx,
+        None,
+    )
+    .await?;
+    agent.wait().await.map(|status| status.code())
+}
+
+/// Spawn the workload entrypoint behind the boundary, wire up SSH and the
+/// supervisor session, and return an owned [`SpawnedAgent`] handle.
+///
+/// The agent keeps running after this returns; the caller drives it through
+/// [`SpawnedAgent::wait`]/[`SpawnedAgent::signal`]. This is the placement-
+/// sensitive spawn the in-pod backend's `RunningBoundary` owns (RFC 0012):
+/// the returned handle, not an exit code, is the process control surface.
+///
+/// # Errors
+///
+/// Returns an error if SSH server startup fails or if the entrypoint child
+/// fails to spawn.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn spawn_workload(
+    program: &str,
+    args: &[String],
+    workdir: Option<&str>,
+    timeout_secs: u64,
+    interactive: bool,
+    sandbox_id: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    ssh_socket_path: Option<String>,
+    shared_ssh_socket: bool,
+    policy: &SandboxPolicy,
+    resolved_process_identity: ResolvedProcessIdentity,
+    enforcement_mode: ProcessEnforcementMode,
+    entrypoint_pid: Arc<AtomicU32>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    provider_credentials: ProviderCredentialState,
+    provider_env: std::collections::HashMap<String, String>,
+    ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    agent_proposals: AgentProposals,
+    #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
+    #[cfg(target_os = "linux")] bypass_denial_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<DenialEvent>,
+    >,
+    #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
+    boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
+) -> Result<SpawnedAgent> {
     // Platform drivers with a resolved numeric UID/GID retain the legacy
     // account-file update. OCI-image identity leaves those environment values
     // empty, so the image's account files remain unchanged.
@@ -104,12 +292,7 @@ pub async fn run_process(
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::prepare_filesystem_with_identity(
-            policy,
-            resolved_process_identity,
-            workspace.root(),
-            workspace.home().is_some(),
-        )?;
+        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
     }
 
     // Eagerly fetch initial settings and install the agent skill if the
@@ -118,18 +301,10 @@ pub async fn run_process(
     // the flag stays at its default (false) and no skill is installed.
     install_initial_agent_skill(sandbox_id, openshell_endpoint, &agent_proposals).await;
 
-    // Provider token grants may mount supervisor-only identity sockets such as
-    // the SPIFFE Workload API. Prepare the child mount namespace that hides
-    // those mounts before supervisor seccomp hardening removes the needed
-    // namespace syscalls.
-    #[cfg(target_os = "linux")]
-    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
-
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
-    // helpers (network namespace setup, identity mount namespace setup,
-    // nftables probes via run_networking), and the SSH listener and entrypoint
-    // child have not been exposed yet.
+    // helpers (network namespace setup, nftables probes via run_networking),
+    // and the SSH listener and entrypoint child have not been exposed yet.
     crate::sandbox::apply_supervisor_startup_hardening()?;
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
@@ -138,7 +313,7 @@ pub async fn run_process(
     // proxy. Spawn it before the entrypoint child so the first packets are
     // not missed. Best-effort: returns None when dmesg is unavailable.
     #[cfg(target_os = "linux")]
-    let _bypass_handle = netns.and_then(|ns| {
+    let bypass_handle = netns.and_then(|ns| {
         crate::bypass_monitor::spawn(
             ns.name().to_string(),
             entrypoint_pid.clone(),
@@ -205,7 +380,11 @@ pub async fn run_process(
                     break;
                 };
 
-                if managed_children::is_managed(pid.as_raw()) {
+                // Serialize the managed-child check and reap with every
+                // spawn-and-register operation. A fast child must not be
+                // mistaken for an orphan between `spawn()` and registration.
+                let registry = managed_children::lock();
+                if registry.contains(pid.as_raw()) {
                     // Let the explicit waiter own this child status.
                     break;
                 }
@@ -231,40 +410,13 @@ pub async fn run_process(
     // Without this, SSH-spawned shells run in the host namespace and bypass
     // the proxy entirely.
     #[cfg(target_os = "linux")]
-    let ssh_netns_fd = netns.and_then(NetworkNamespace::ns_fd);
+    let ssh_netns_fd = netns
+        .map(NetworkNamespace::try_clone_ns_fd)
+        .transpose()?
+        .flatten()
+        .map(Arc::new);
     #[cfg(not(target_os = "linux"))]
-    let ssh_netns_fd: Option<i32> = None;
-
-    #[cfg(target_os = "linux")]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        &workspace,
-        interactive,
-        policy,
-        resolved_process_identity,
-        enforcement_mode,
-        netns,
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
-
-    #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        &workspace,
-        interactive,
-        policy,
-        resolved_process_identity,
-        enforcement_mode,
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
-
-    let main_pid = handle.pid();
-    let main_session = crate::main_session::MainSession::new(handle.take_io(), main_pid);
-    let main_instance_id = uuid::Uuid::new_v4().to_string();
+    let ssh_netns_fd: Option<Arc<OwnedFd>> = None;
 
     // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
     // their env so cooperative tools (curl, npm, Node) route through the
@@ -275,39 +427,54 @@ pub async fn run_process(
     #[cfg(not(target_os = "linux"))]
     let ssh_proxy_url = ssh_proxy_url_for_policy(policy, None);
 
+    let user_environment: std::collections::HashMap<String, String> =
+        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+    let boundary_runtime =
+        boundary_runtime.unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new);
+    let port_forward: Arc<dyn BoundaryPortForward> =
+        Arc::new(crate::boundary_io::NetnsPortForward::new(
+            ssh_netns_fd.clone(),
+            Some(boundary_runtime.clone()),
+        ));
+    let boundary_exec: Arc<dyn BoundaryExec> =
+        Arc::new(crate::boundary_exec::LocalBoundaryExec::new(
+            policy.clone(),
+            workdir.map(str::to_string),
+            ssh_netns_fd,
+            ssh_proxy_url.clone(),
+            ca_file_paths.clone().map(Arc::new),
+            provider_credentials.clone(),
+            user_environment.clone(),
+            resolved_process_identity,
+            enforcement_mode,
+            boundary_runtime.clone(),
+        ));
+
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
-        let policy_clone = policy.clone();
-        let workspace_clone = workspace.clone();
-        let proxy_url = ssh_proxy_url;
-        let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
-        let provider_credentials_clone = provider_credentials.clone();
-        let main_session_clone = Arc::clone(&main_session);
-        let user_env_clone: std::collections::HashMap<String, String> =
-            std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-                .ok()
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
+        // Inject the in-pod loopback port-forward (RFC 0012). The SSH server
+        // drives it through the `BoundaryPortForward` interface, so a delegated
+        // backend would supply a different implementation without the SSH
+        // server changing.
+        let ssh_port_forward = port_forward.clone();
+        let ssh_boundary_exec = boundary_exec.clone();
+
         tokio::spawn(async move {
-            let _ssh_exit_guard = ssh_exit_tx;
             if let Err(err) = crate::ssh::run_ssh_server(
                 listen_path,
                 ssh_ready_tx,
-                policy_clone,
-                workspace_clone,
-                netns_fd,
-                proxy_url,
                 ca_paths,
-                provider_credentials_clone,
-                user_env_clone,
-                resolved_process_identity,
                 enforcement_mode,
                 shared_ssh_socket,
-                main_session_clone,
+                ssh_port_forward,
+                ssh_boundary_exec,
             )
             .await
             {
@@ -353,39 +520,61 @@ pub async fn run_process(
     }
 
     let supervisor_terminating = Arc::new(AtomicBool::new(false));
-    // A canonical process may have completed while the SSH socket was being
-    // prepared. Never open a readiness-bearing supervisor session for a child
-    // that is already terminal.
-    let early_exit = handle.try_wait().into_diagnostic()?;
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
     // and sandbox identity. The session provides relay channels for SSH
     // connect and ExecSandbox through the gateway.
-    let supervisor_session_task = if early_exit.is_none()
-        && let (Some(endpoint), Some(id), Some(socket)) =
-            (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    if let (Some(endpoint), Some(id), Some(socket)) =
+        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
-        let task = crate::supervisor_session::spawn(
+        crate::supervisor_session::spawn(
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),
-            ssh_netns_fd,
+            port_forward.clone(),
             None,
             Arc::clone(&supervisor_terminating),
-            main_instance_id.clone(),
         );
         info!("supervisor session task spawned");
-        Some(task)
-    } else {
-        None
-    };
+    }
+
+    #[cfg(target_os = "linux")]
+    let handle = ProcessHandle::spawn(
+        program,
+        args,
+        workdir,
+        interactive,
+        boundary_runtime.requires_dedicated_process_group(),
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        netns,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
+
+    #[cfg(not(target_os = "linux"))]
+    let handle = ProcessHandle::spawn(
+        program,
+        args,
+        workdir,
+        interactive,
+        boundary_runtime.requires_dedicated_process_group(),
+        policy,
+        resolved_process_identity,
+        enforcement_mode,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if early_exit.is_none()
-        && let Some(tx) = entrypoint_started_tx
-    {
-        let _ = tx.send((handle.pid(), main_instance_id.clone()));
+    let (terminal, signal_lock) = handle.signaling_state();
+    boundary_runtime
+        .register_process_group(handle.pid(), terminal, signal_lock)
+        .map_err(|error| miette::miette!(error.to_string()))?;
+    if let Some(tx) = entrypoint_started_tx {
+        let _ = tx.send(handle.pid());
     }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -400,95 +589,224 @@ pub async fn run_process(
             .build()
     );
 
-    let outcome = if let Some(status) = early_exit {
-        ProcessWaitOutcome::Exited(status)
-    } else {
-        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
-            .await?
-    };
+    Ok(SpawnedAgent {
+        handle,
+        timeout_secs,
+        supervisor_terminating,
+        #[cfg(target_os = "linux")]
+        _bypass_handle: bypass_handle,
+        boundary_exec,
+        port_forward,
+        boundary_runtime,
+    })
+}
 
-    let rendered_code = match outcome {
-        ProcessWaitOutcome::Exited(status) => status.code(),
-        ProcessWaitOutcome::TimedOut => {
+/// An owned, running workload entrypoint plus the background guards whose
+/// lifetime is tied to it (the bypass monitor).
+///
+/// The in-pod `RunningBoundary` owns this; dropping it kills the child via the
+/// handle's `kill_on_drop`.
+pub struct SpawnedAgent {
+    handle: ProcessHandle,
+    timeout_secs: u64,
+    supervisor_terminating: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    _bypass_handle: Option<tokio::task::JoinHandle<()>>,
+    boundary_exec: Arc<dyn BoundaryExec>,
+    port_forward: Arc<dyn BoundaryPortForward>,
+    boundary_runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+}
+
+impl SpawnedAgent {
+    /// The host PID of the entrypoint, for diagnostics only.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.handle.pid()
+    }
+
+    /// A lock-free signaling handle derived from the entrypoint's pid.
+    ///
+    /// Separated from the waitable [`SpawnedAgent`] so a signal can be delivered
+    /// while another task holds the agent to await it: the running boundary
+    /// keeps the agent behind a mutex for `wait`, but signals go through this
+    /// pid-based handle and never contend for that lock.
+    #[must_use]
+    pub fn signaler(&self) -> AgentSignaler {
+        let (terminal, signal_lock) = self.handle.signaling_state();
+        AgentSignaler {
+            pid: self.handle.pid(),
+            terminal,
+            signal_lock,
+        }
+    }
+
+    /// The executor used by SSH and exposed by the active boundary.
+    #[must_use]
+    pub fn boundary_exec(&self) -> Arc<dyn BoundaryExec> {
+        self.boundary_exec.clone()
+    }
+
+    /// The port-forward implementation used by sessions and exposed by the
+    /// active boundary.
+    #[must_use]
+    pub fn port_forward(&self) -> Arc<dyn BoundaryPortForward> {
+        self.port_forward.clone()
+    }
+
+    #[must_use]
+    pub fn boundary_runtime(&self) -> Arc<crate::boundary_io::BoundaryRuntimeState> {
+        self.boundary_runtime.clone()
+    }
+
+    /// Wait for the entrypoint to exit, applying the policy timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting on the child returns an OS error.
+    pub async fn wait(&mut self) -> Result<ProcessStatus> {
+        let pid = self.handle.pid();
+        let (registration_terminal, _) = self.handle.signaling_state();
+        let outcome = wait_for_process_exit_or_shutdown(
+            &mut self.handle,
+            self.timeout_secs,
+            &self.supervisor_terminating,
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.boundary_runtime
+                    .unregister_process_group(pid, &registration_terminal);
+                self.boundary_runtime.deactivate();
+                return Err(error);
+            }
+        };
+
+        let (status, emit_normal_exit) = match outcome {
+            ProcessWaitOutcome::Exited(status) => (status, true),
+            ProcessWaitOutcome::TimedOut => {
+                ocsf_emit!(
+                    ProcessActivityBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Close)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message("Process timed out, killing")
+                        .build()
+                );
+                (ProcessStatus::exited(124), false)
+            }
+            ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+                info!(
+                    signal,
+                    exit_code = status.code(),
+                    "Entrypoint exited after supervisor shutdown signal"
+                );
+                (status, true)
+            }
+        };
+
+        self.boundary_runtime
+            .unregister_process_group(pid, &registration_terminal);
+        self.boundary_runtime.deactivate();
+
+        if emit_normal_exit {
             ocsf_emit!(
                 ProcessActivityBuilder::new(ocsf_ctx())
                     .activity(ActivityId::Close)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message("Process timed out, killing")
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .exit_code(status.code())
+                    .message(format!("Process exited with code {}", status.code()))
                     .build()
             );
-            124
         }
-        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
-            info!(
-                signal,
-                exit_code = status.code(),
-                "Entrypoint exited after supervisor shutdown signal"
-            );
-            status.code()
-        }
-    };
-    supervisor_terminating.store(true, Ordering::Release);
-    main_session.finish(rendered_code).await;
 
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Close)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .exit_code(rendered_code)
-            .message(format!("Process exited with code {rendered_code}"))
-            .build()
-    );
-
-    if let Some(task) = supervisor_session_task {
-        task.abort();
-    }
-    if let Some(tx) = sidecar_exit_tx {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        tx.send((main_instance_id.clone(), rendered_code, ack_tx))
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter closed"))?;
-        ack_rx
-            .await
-            .map_err(|_| miette::miette!("sidecar exit reporter dropped acknowledgement"))?
-            .map_err(|error| miette::miette!(error))?;
-    } else if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-        report_main_process_exit_until_ack(endpoint, id, &main_instance_id, rendered_code).await;
-        info!(instance_id = %main_instance_id, "main-process exit acknowledged");
+        Ok(status)
     }
 
-    Ok(rendered_code)
+    /// Send a signal to the entrypoint process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signal cannot be delivered.
+    #[cfg(unix)]
+    pub fn signal(&self, sig: nix::sys::signal::Signal) -> Result<()> {
+        self.handle.signal(sig)
+    }
+
+    /// Terminate the entrypoint (SIGTERM, then SIGKILL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process cannot be killed.
+    pub fn kill(&mut self) -> Result<()> {
+        self.handle.kill()
+    }
 }
 
-async fn report_main_process_exit_until_ack(
-    endpoint: &str,
-    sandbox_id: &str,
-    instance_id: &str,
-    exit_code: i32,
-) {
-    let mut retry_delay = Duration::from_millis(250);
-    loop {
-        match crate::supervisor_session::report_main_process_exit(
-            endpoint,
-            sandbox_id,
-            instance_id,
-            exit_code,
-        )
-        .await
-        {
-            Ok(()) => return,
-            Err(error) => {
-                tracing::warn!(%error, "main-process exit report failed; retrying");
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
-            }
+/// A lock-free, pid-based signaling handle to a spawned agent.
+///
+/// Delivers signals to the entrypoint process without holding the waitable
+/// handle's lock, so a signal and an in-flight `wait` never deadlock.
+/// Placement-neutral signal mapping (e.g. RFC 0012's `BoundarySignal`) is the
+/// caller's job; this handle exposes only the concrete deliveries so `nix`
+/// stays in this crate.
+#[derive(Clone)]
+pub struct AgentSignaler {
+    pid: u32,
+    terminal: Arc<AtomicBool>,
+    signal_lock: Arc<std::sync::Mutex<()>>,
+}
+
+#[cfg(unix)]
+impl AgentSignaler {
+    fn deliver(&self, sig: nix::sys::signal::Signal) -> Result<()> {
+        use nix::unistd::Pid;
+        let _signal_guard = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(miette::miette!("agent has exited"));
         }
+        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+        nix::sys::signal::killpg(Pid::from_raw(pid), sig).into_diagnostic()
+    }
+
+    /// Send `SIGTERM`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn term(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGTERM)
+    }
+
+    /// Send `SIGKILL`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn kill(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGKILL)
+    }
+
+    /// Send `SIGINT`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn interrupt(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGINT)
+    }
+
+    /// Send `SIGHUP`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn hangup(&self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGHUP)
     }
 }
 
@@ -521,6 +839,10 @@ async fn wait_for_process_exit_or_shutdown(
             () = &mut deadline => {
                 terminating.store(true, Ordering::Release);
                 terminate_then_kill_pid(pid).await;
+                // Finish the owned wait after terminating the process. Dropping
+                // it here would leave terminal publication, reaping, and
+                // managed-child cleanup pending until supervisor exit.
+                let _ = (&mut wait).await.into_diagnostic()?;
                 Ok(ProcessWaitOutcome::TimedOut)
             }
             signal = wait_for_supervisor_shutdown_signal() => {
@@ -567,13 +889,16 @@ fn signal_entrypoint_for_shutdown(_pid: u32, _signal: &'static str) {}
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: nix::sys::signal::Signal, reason: &'static str) {
     let raw_pid = i32::try_from(pid).unwrap_or(i32::MAX);
-    if let Err(error) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-raw_pid), signal) {
+    let target = nix::unistd::Pid::from_raw(raw_pid);
+    let result = nix::sys::signal::killpg(target, signal)
+        .or_else(|_| nix::sys::signal::kill(target, signal));
+    if let Err(error) = result {
         tracing::warn!(
             pid,
             signal = ?signal,
             reason,
             error = %error,
-            "failed to signal entrypoint process group"
+            "failed to signal entrypoint process"
         );
     }
 }
@@ -719,5 +1044,43 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_reaps_child_and_clears_managed_registration() {
+        let args = vec!["30".to_string()];
+        let mut handle = ProcessHandle::spawn(
+            "/bin/sleep",
+            &args,
+            None,
+            false,
+            true,
+            &policy(NetworkMode::Allow, None),
+            ResolvedProcessIdentity::default(),
+            ProcessEnforcementMode::NetworkOnly,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .expect("spawn timeout child");
+        let pid = handle.pid();
+        let terminating = AtomicBool::new(false);
+
+        let outcome = wait_for_process_exit_or_shutdown(&mut handle, 1, &terminating)
+            .await
+            .expect("timeout wait");
+
+        assert!(matches!(outcome, ProcessWaitOutcome::TimedOut));
+        assert!(!managed_children::is_managed(
+            i32::try_from(pid).expect("valid pid")
+        ));
+        assert!(matches!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("valid pid")),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+            ),
+            Err(nix::errno::Errno::ECHILD)
+        ));
     }
 }

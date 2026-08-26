@@ -21,7 +21,7 @@ use openshell_isolation::contract::{
     BackendError, BoundaryDuplexStream, BoundaryPortForward, LoopbackTarget,
 };
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -204,13 +204,9 @@ impl BoundaryPortForward for NetnsPortForward {
             runtime.ensure_active()?;
         }
         let addr = std::net::SocketAddr::new(target.host(), target.port());
-        let addr_string = addr.to_string();
-        let stream = crate::ssh::connect_in_netns(
-            &addr_string,
-            self.netns_fd.as_deref().map(AsRawFd::as_raw_fd),
-        )
-        .await
-        .map_err(|e| BackendError::Process(format!("port-forward connect to {addr}: {e}")))?;
+        let stream = crate::ssh::connect_in_netns(addr, self.netns_fd.clone())
+            .await
+            .map_err(|e| BackendError::Process(format!("port-forward connect to {addr}: {e}")))?;
         if let Some(runtime) = &self.runtime {
             runtime.ensure_active()?;
         }

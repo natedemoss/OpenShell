@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(dead_code)]
+
 //! Local control channel for Kubernetes sidecar topology.
 //!
 //! The network sidecar owns gateway credentials. The process supervisor in the

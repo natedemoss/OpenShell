@@ -23,6 +23,7 @@ use openshell_sandbox::run_sandbox;
 /// to copy the binary out. Invoking the binary itself with this argument
 /// performs the copy in pure Rust.
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
+const VM_GUEST_SUBCOMMAND: &str = "vm-guest";
 
 /// Subcommand for one-shot debug RPCs from inside a sandbox container.
 ///
@@ -32,14 +33,13 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
-const VALIDATE_WORKSPACE_SUBCOMMAND: &str = "validate-workspace";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
-const SIDECAR_STATE_DIR: &str = openshell_core::container_paths::SIDECAR_RUN_ROOT;
-const SIDECAR_TLS_DIR: &str = openshell_core::container_paths::SIDECAR_TLS_DIR;
+const SIDECAR_STATE_DIR: &str = "/run/openshell-sidecar";
+const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
 #[cfg(target_os = "linux")]
-const CLIENT_TLS_DIR: &str = openshell_core::container_paths::CLIENT_TLS_DIR;
+const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
 #[cfg(target_os = "linux")]
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
@@ -111,7 +111,8 @@ impl std::str::FromStr for Mode {
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Defaults to `/bin/bash -l` if neither this nor the driver specification is provided.
+    /// Can also be provided via `OPENSHELL_SANDBOX_COMMAND` environment variable.
+    /// Defaults to `/bin/bash` if neither is provided.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 
@@ -230,55 +231,17 @@ struct Args {
     #[arg(long)]
     upstream_proxy_connect_by_hostname: bool,
 
-    /// Path to a PEM CA bundle trusted for the corporate proxy: the TLS
-    /// handshake with an `https://` proxy and, for TLS-intercepting proxies,
-    /// re-signed upstream certificates and the sandbox trust bundle.
+    /// Backend named by the compute driver's topology descriptor.
     #[arg(long)]
-    upstream_proxy_ca_bundle: Option<String>,
-}
+    topology_backend_name: Option<String>,
 
-/// Internal one-shot command used by the privileged supervisor to validate an
-/// image-provided workdir as the final sandbox identity.
-#[derive(Parser, Debug)]
-#[command(name = "validate-workspace", hide = true)]
-struct ValidateWorkspaceArgs {
+    /// Isolation Backend interface version named by the topology descriptor.
     #[arg(long)]
-    workdir: String,
-    #[arg(long)]
-    expected_uid: u32,
-    #[arg(long)]
-    expected_gid: u32,
-}
+    topology_version: Option<u32>,
 
-#[cfg(target_os = "linux")]
-fn validate_workspace(args: &[String]) -> Result<()> {
-    let args = ValidateWorkspaceArgs::try_parse_from(
-        std::iter::once(VALIDATE_WORKSPACE_SUBCOMMAND.to_string()).chain(args.iter().cloned()),
-    )
-    .into_diagnostic()?;
-    let actual = (
-        nix::unistd::geteuid().as_raw(),
-        nix::unistd::getegid().as_raw(),
-    );
-    if actual != (args.expected_uid, args.expected_gid) {
-        return Err(miette::miette!(
-            "workspace validator privilege drop failed: expected {}:{}, got {}:{}",
-            args.expected_uid,
-            args.expected_gid,
-            actual.0,
-            actual.1
-        ));
-    }
-    openshell_supervisor_process::process::validate_oci_workspace_as_effective_identity(Path::new(
-        &args.workdir,
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn validate_workspace(_args: &[String]) -> Result<()> {
-    Err(miette::miette!(
-        "workspace validation is only supported on Unix"
-    ))
+    /// Base64-encoded opaque topology-descriptor payload.
+    #[arg(long)]
+    topology_payload_base64: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -477,23 +440,16 @@ fn run_network_init(
 
 #[cfg(target_os = "linux")]
 fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
-    if proxy_user_id != 0
-        && !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
-            .contains(&proxy_user_id)
-    {
+    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
-            "--proxy-uid must be 0 or in range [{}, {}]",
-            openshell_policy::MIN_SANDBOX_PROXY_UID,
-            openshell_policy::MAX_SANDBOX_UID,
+            "--proxy-uid must be 0 or at least {}",
+            openshell_policy::MIN_SANDBOX_UID
         ));
     }
-    if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
-        .contains(&proxy_primary_group_id)
-    {
+    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
-            "--proxy-gid must be in range [{}, {}]",
-            openshell_policy::MIN_SANDBOX_UID,
-            openshell_policy::MAX_SANDBOX_UID,
+            "--proxy-gid must be at least {}",
+            openshell_policy::MIN_SANDBOX_UID
         ));
     }
     Ok(())
@@ -522,6 +478,15 @@ fn main() -> Result<()> {
         })?;
         return copy_self(dest);
     }
+    if raw_args.get(1).map(String::as_str) == Some(VM_GUEST_SUBCOMMAND) {
+        let [_, _, config] = raw_args.as_slice() else {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {VM_GUEST_SUBCOMMAND} <CONFIG>"
+            ));
+        };
+        return openshell_isolation_vm::run_guest(Path::new(config))
+            .map_err(|error| miette::miette!(error));
+    }
 
     // Handle `debug-rpc <subcommand> [args]` before clap. Uses a small
     // dedicated runtime so we don't pay the supervisor's full startup cost.
@@ -535,9 +500,6 @@ fn main() -> Result<()> {
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
-    }
-    if raw_args.get(1).map(String::as_str) == Some(VALIDATE_WORKSPACE_SUBCOMMAND) {
-        return validate_workspace(&raw_args[2..]);
     }
 
     let args = Args::parse();
@@ -655,19 +617,11 @@ fn main() -> Result<()> {
             (None, None)
         };
 
-        // Resolve an exact canonical process. Explicit offline/test argv wins;
-        // drivers otherwise provide a versioned JSON transport so argument
-        // boundaries are never reconstructed with shell parsing.
-        let workdir = args.workdir.clone();
-        let (command, interactive) = if !args.command.is_empty() {
-            (args.command, args.interactive)
-        } else if let Ok(json) = std::env::var(openshell_core::sandbox_env::MAIN_PROCESS_SPEC) {
-            let config = openshell_core::sandbox_env::MainProcessConfig::decode(&json)
-                .map_err(|error| miette::miette!("{error}"))?;
-            (config.command, config.tty)
+        // Get command - either from CLI args, environment variable, or default to /bin/bash
+        let command = if args.command.is_empty() {
+            vec!["/bin/bash".to_string()]
         } else {
-            let config = openshell_core::sandbox_env::MainProcessConfig::scratch();
-            (config.command, config.tty)
+            args.command
         };
 
         info!(command = ?command, "Starting sandbox");
@@ -681,14 +635,37 @@ fn main() -> Result<()> {
             proxy_auth_file: args.upstream_proxy_auth_file,
             proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname,
-            proxy_ca_bundle: args.upstream_proxy_ca_bundle,
+            proxy_ca_bundle: None,
+        };
+
+        let topology_descriptor = match (
+            args.topology_backend_name,
+            args.topology_version,
+            args.topology_payload_base64,
+        ) {
+            (None, None, None) => None,
+            (Some(backend_name), Some(version), Some(payload)) => {
+                use base64::Engine as _;
+                Some(openshell_isolation::contract::TopologyDescriptor {
+                    backend_name,
+                    version,
+                    payload: base64::engine::general_purpose::STANDARD
+                        .decode(payload)
+                        .into_diagnostic()?,
+                })
+            }
+            _ => {
+                return Err(miette::miette!(
+                    "topology descriptor requires backend name, version, and payload"
+                ));
+            }
         };
 
         run_sandbox(
             command,
-            workdir,
+            args.workdir,
             args.timeout,
-            interactive,
+            args.interactive,
             args.sandbox_id,
             args.sandbox,
             args.openshell_endpoint,
@@ -702,6 +679,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            topology_descriptor,
         )
         .await
     })?;
@@ -714,29 +692,19 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn workspace_validation_subcommand_uses_final_policy_identity() {
-        let uid = nix::unistd::geteuid().as_raw();
-        let gid = nix::unistd::getegid().as_raw();
-        if uid < 1000 || gid < 1000 {
-            return;
-        }
-        let dir = tempfile::tempdir_in("/tmp").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
-        let root = dir.path().canonicalize().unwrap().join("workspace");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let args = vec![
-            "--workdir".to_string(),
-            root.display().to_string(),
-            "--expected-uid".to_string(),
-            uid.to_string(),
-            "--expected-gid".to_string(),
-            gid.to_string(),
-        ];
-
-        validate_workspace(&args).expect("current identity should retain workspace authority");
+    fn topology_descriptor_selects_vm_backend() {
+        let args = Args::try_parse_from([
+            "openshell-sandbox",
+            "--topology-backend-name=vm",
+            "--topology-version=1",
+            "--topology-payload-base64=",
+            "/bin/true",
+        ])
+        .expect("parse VM backend flags");
+        assert_eq!(args.topology_backend_name.as_deref(), Some("vm"));
+        assert_eq!(args.topology_version, Some(1));
+        assert_eq!(args.topology_payload_base64.as_deref(), Some(""));
     }
 
     /// Drives `copy_self`'s file-copy logic against an arbitrary source path
@@ -824,23 +792,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
-        validate_network_init_ids(0, 30).unwrap();
+        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn network_init_still_rejects_low_non_root_proxy_uid_and_root_gid() {
+    fn network_init_still_rejects_low_non_root_proxy_ids() {
         let uid_err =
             validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
         assert!(uid_err.to_string().contains("--proxy-uid"));
 
-        let gid_err = validate_network_init_ids(0, 0).unwrap_err();
+        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
         assert!(gid_err.to_string().contains("--proxy-gid"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn network_init_accepts_non_root_system_proxy_group() {
-        validate_network_init_ids(openshell_policy::MIN_SANDBOX_PROXY_UID, 30).unwrap();
     }
 }

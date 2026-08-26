@@ -5,15 +5,12 @@
 # Run the Rust e2e smoke test against an openshell-gateway running the
 # standalone VM compute driver (`openshell-driver-vm`).
 #
-# Architecture (post supervisor-initiated relay, PR #867):
-#   * The gateway never dials the sandbox. Instead, the in-guest
-#     supervisor opens an outbound `ConnectSupervisor` gRPC stream to
-#     the gateway on startup and keeps it alive for the sandbox
-#     lifetime. SSH (`/connect/ssh`) and `ExecSandbox` traffic ride the
-#     same TCP+TLS+HTTP/2 connection as multiplexed HTTP/2 streams.
-#   * There is no host-side SSH port forward. gvproxy still provides
-#     guest egress so the supervisor can reach the gateway, but it no
-#     longer forwards any TCP port back to the guest.
+# Architecture (RFC 0012 VM topology):
+#   * The logical openshell-sandbox supervisor runs on the host and opens
+#     `ConnectSupervisor` to the gateway.
+#   * An authenticated guest process leaf receives lifecycle, exec/PTY,
+#     loopback-forward, and mediated network streams over virtio-vsock.
+#   * Gateway credentials and the network-policy engine stay outside the VM.
 #   * Readiness is authoritative on the gateway: a sandbox's phase
 #     flips to `Ready` the moment `ConnectSupervisor` registers, and
 #     back to `Provisioning` when the session drops. The VM driver
@@ -24,9 +21,10 @@
 #
 # What the script does:
 #   1. When no prebuilt VM driver is supplied, ensures the VM runtime
-#      (libkrun + gvproxy) and bundled supervisor are staged.
-#   2. Builds `openshell-gateway`, `openshell-driver-vm`, and the
-#      `openshell` CLI with the embedded runtime as needed. When CI supplies
+#      (libkrun + gvproxy) and guest process leaf are staged.
+#   2. Builds `openshell-gateway`, `openshell-sandbox`,
+#      `openshell-driver-vm`, and the `openshell` CLI with the embedded
+#      runtime as needed. When CI supplies
 #      OPENSHELL_GATEWAY_BIN, OPENSHELL_VM_DRIVER_BIN, or OPENSHELL_BIN, the
 #      matching prebuilt binary is reused instead of rebuilt.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
@@ -40,7 +38,7 @@
 #
 # Prerequisites (handled automatically by this script for local VM-driver builds):
 #   - `mise run vm:setup`      — downloads / builds the libkrun runtime.
-#   - `mise run vm:supervisor` — builds the bundled sandbox supervisor.
+#   - `mise run vm:supervisor` — builds the portable guest process leaf.
 
 set -euo pipefail
 
@@ -51,9 +49,13 @@ COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
+HOST_SUPERVISOR_BIN="${OPENSHELL_VM_SUPERVISOR_BIN:-${ROOT}/target/debug/openshell-sandbox}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
+BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
+IMAGE_CACHE_DIR="${OPENSHELL_E2E_VM_IMAGE_CACHE_DIR:-}"
+ORIGINAL_ARGS=("$@")
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -66,17 +68,62 @@ STATE_DIR_ROOT="/tmp"
 
 # Smoke test timeouts. First boot extracts the embedded libkrun runtime
 # (~60-90MB of zstd per architecture) and prepares an ext4 root disk from the
-# configured image. The guest then starts the sandbox supervisor directly; a cold
-# microVM is typically ready within ~15s after image preparation.
+# configured image. The guest then starts the process leaf while the logical
+# supervisor stays on the host; a cold microVM is typically ready within ~15s
+# after image preparation.
 GATEWAY_READY_TIMEOUT=60
 SANDBOX_PROVISION_TIMEOUT=180
 
 # ── Build prerequisites ──────────────────────────────────────────────
 
+configure_bindgen_include() {
+  local gcc_include
+  command -v gcc >/dev/null 2>&1 || return 0
+  gcc_include="$(gcc -print-file-name=include)"
+  [ -f "${gcc_include}/stdbool.h" ] || return 0
+  case " ${BINDGEN_EXTRA_CLANG_ARGS:-} " in
+    *" -isystem ${gcc_include} "*) ;;
+    *)
+      export BINDGEN_EXTRA_CLANG_ARGS="${BINDGEN_EXTRA_CLANG_ARGS:+${BINDGEN_EXTRA_CLANG_ARGS} }-isystem ${gcc_include}"
+      ;;
+  esac
+}
+
+ensure_kvm_access() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  [ -e /dev/kvm ] || {
+    echo "ERROR: /dev/kvm does not exist; enable KVM on this host" >&2
+    exit 1
+  }
+  if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    return 0
+  fi
+
+  local kvm_group command arg
+  kvm_group="$(stat -c %G /dev/kvm)"
+  if [ "${OPENSHELL_E2E_VM_KVM_REEXEC:-0}" != "1" ] \
+      && command -v sg >/dev/null 2>&1 \
+      && [[ " $(id -nG "$(id -un)") " == *" ${kvm_group} "* ]]; then
+    echo "==> Entering the configured ${kvm_group} group for VM e2e"
+    export OPENSHELL_E2E_VM_KVM_REEXEC=1
+    printf -v command 'exec %q' "${ROOT}/e2e/rust/e2e-vm.sh"
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+      printf -v command '%s %q' "${command}" "${arg}"
+    done
+    exec sg "${kvm_group}" -c "${command}"
+  fi
+
+  echo "ERROR: /dev/kvm is not readable and writable; add $(id -un) to ${kvm_group} and start a new login session" >&2
+  exit 1
+}
+
 if [ -n "${RUSTC_WRAPPER:-}" ] && [ "${OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER:-0}" != "1" ]; then
   echo "==> Building without RUSTC_WRAPPER=${RUSTC_WRAPPER} (set OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER=1 to keep it)"
   unset RUSTC_WRAPPER
 fi
+
+configure_bindgen_include
+ensure_kvm_access
 
 if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
   mkdir -p "${COMPRESSED_DIR}"
@@ -86,8 +133,9 @@ if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
     mise run vm:setup
   fi
 
-  if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
-    echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
+  if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ] \
+      || [ ! -f "${COMPRESSED_DIR}/openshell-runtime.tar.zst" ]; then
+    echo "==> Building portable VM guest process leaf (mise run vm:supervisor)"
     mise run vm:supervisor
   fi
 
@@ -97,6 +145,11 @@ else
 fi
 
 build_packages=()
+if [ -z "${OPENSHELL_VM_SUPERVISOR_BIN:-}" ]; then
+  build_packages+=(-p openshell-sandbox)
+else
+  echo "==> Using prebuilt host supervisor at ${HOST_SUPERVISOR_BIN}"
+fi
 if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
   if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     echo "==> Building driver-free openshell-gateway"
@@ -128,7 +181,8 @@ fi
 for pair in \
   "openshell-gateway:${GATEWAY_BIN}" \
   "openshell-driver-vm:${DRIVER_BIN}" \
-  "openshell CLI:${CLI_BIN}"; do
+  "openshell CLI:${CLI_BIN}" \
+  "host supervisor:${HOST_SUPERVISOR_BIN}"; do
   label="${pair%%:*}"
   path="${pair#*:}"
   if [ ! -x "${path}" ]; then
@@ -137,6 +191,7 @@ for pair in \
   fi
 done
 export OPENSHELL_BIN="${CLI_BIN}"
+export OPENSHELL_VM_SUPERVISOR_BIN="${HOST_SUPERVISOR_BIN}"
 DRIVER_DIR="$(dirname "${DRIVER_BIN}")"
 
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -162,6 +217,11 @@ s.close()')"
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
+if [ -n "${IMAGE_CACHE_DIR}" ]; then
+  mkdir -p "${IMAGE_CACHE_DIR}"
+  ln -s "${IMAGE_CACHE_DIR}" "${RUN_STATE_DIR}/images"
+  echo "==> Reusing VM image cache at ${IMAGE_CACHE_DIR}"
+fi
 export XDG_CONFIG_HOME="${RUN_STATE_DIR}/config"
 export XDG_DATA_HOME="${RUN_STATE_DIR}/data"
 
@@ -243,12 +303,7 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # `~/.local/libexec/openshell/openshell-driver-vm` when present,
 # which silently shadows development builds — a subtle source of
 # stale-binary bugs in e2e runs.
-# `grpc_endpoint` is the URL the VM driver passes into each guest as
-# OPENSHELL_ENDPOINT. The supervisor inside the VM dials this address.
-# Use `host.openshell.internal` rather than `127.0.0.1` so gvproxy's
-# host-loopback proxy carries the connection while keeping the endpoint aligned
-# with package-managed gateway certificates. gvproxy's bare gateway IP
-# (192.168.127.1) does NOT forward arbitrary host ports.
+# `grpc_endpoint` is consumed by the host supervisor, so use host loopback.
 e2e_generate_gateway_jwt "${JWT_DIR}"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
@@ -284,11 +339,14 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
 else
   cat >>"${GATEWAY_CONFIG}" <<EOF
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
+grpc_endpoint = "https://127.0.0.1:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
 guest_tls_cert = "${PKI_DIR}/client/tls.crt"
 guest_tls_key = "${PKI_DIR}/client/tls.key"
+default_image = "${SANDBOX_IMAGE}"
+bootstrap_image = "${BOOTSTRAP_IMAGE}"
 EOF
 fi
 
@@ -381,9 +439,9 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_PID_FILE}"
 
 # The VM driver creates each sandbox VM from a cached read-only ext4 root disk
-# plus a writable overlay disk. The guest's sandbox supervisor then initializes
-# policy, netns, Landlock, and sshd. On a cold host this is ~15s after image
-# preparation; allow 180s for slower CI runners.
+# plus a writable overlay disk. The host supervisor initializes policy and the
+# guest process leaf applies guest-local process isolation. On a cold host this
+# is ~15s after image preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 run_e2e_test() {

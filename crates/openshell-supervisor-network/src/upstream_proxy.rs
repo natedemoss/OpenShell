@@ -655,7 +655,6 @@ fn build_proxy_tls_config(corporate_ca_pem: Option<&str>) -> Arc<ClientConfig> {
         bundle.push_str(pem);
     }
     crate::l7::tls::build_upstream_client_config(&bundle)
-        .expect("corporate proxy TLS config must be valid")
 }
 
 /// Build a `Proxy-Authorization: Basic <base64>` header value from a raw
@@ -2037,10 +2036,10 @@ mod tests {
         // Trusted CA; the client config trusts it, and the fake upstream
         // server presents a leaf for SERVER_HOSTNAME signed by it.
         let ca = tls::SandboxCa::generate().unwrap();
-        let client_config = tls::build_upstream_client_config(ca.cert_pem()).unwrap();
+        let client_config = tls::build_upstream_client_config(ca.cert_pem());
         let tls_state = Arc::new(tls::ProxyTlsState::new(
             tls::CertCache::new(ca),
-            tls::build_upstream_client_config("").unwrap(),
+            tls::build_upstream_client_config(""),
         ));
 
         // Fake upstream TLS server: accepts tunneled connections and completes

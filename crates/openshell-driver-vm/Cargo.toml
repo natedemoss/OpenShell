@@ -21,9 +21,12 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-otel = { path = "../openshell-otel" }
+openshell-isolation = { path = "../openshell-isolation" }
+openshell-isolation-vm = { path = "../openshell-isolation-vm" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-vfio = { path = "../openshell-vfio" }
 
+base64 = { workspace = true }
 bollard = { version = "0.20", features = ["ssh"] }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
@@ -41,6 +44,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 miette = { workspace = true }
+rand = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

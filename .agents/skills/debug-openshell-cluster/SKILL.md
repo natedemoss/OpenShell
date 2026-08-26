@@ -577,9 +577,32 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
 
 - The VM driver process is running and reachable by the gateway.
-- The runtime rootfs exists and matches the expected architecture.
-- Host virtualization support is enabled.
-- The sandbox supervisor can establish its callback connection to the gateway.
+- The custom kernel and runtime rootfs exist and match the expected architecture.
+- Host virtualization support is enabled and the active process can read and write `/dev/kvm`.
+- The native host supervisor can establish its callback connection to the gateway.
+- The guest process leaf accepts the authenticated virtio-vsock control channel.
+
+For the managed libkrun driver, inspect the per-sandbox host-supervisor and
+guest-console logs separately:
+
+```bash
+rg -n 'vm|grpc_endpoint|guest_tls|state_dir' .cache/gateway-vm/gateway.toml
+stat /dev/kvm
+id
+find /tmp/openshell-vm-driver-*/sandboxes -name 'supervisor*.log' -o -name 'rootfs-console.log'
+tail -n 200 /tmp/openshell-vm-driver-*/sandboxes/*/supervisor.err.log
+tail -n 200 /tmp/openshell-vm-driver-*/sandboxes/*/rootfs-console.log
+```
+
+The historical `guest_tls_*` configuration fields are host-supervisor mTLS
+paths and must never appear in the guest image. `grpc_endpoint` is also
+host-reachable; loopback is valid. A successful guest boot logs
+`VM process supervisor leaf listening on vsock port ...`. libkrun needs KVM but
+does not need `CAP_NET_ADMIN`. QEMU/VFIO uses TAP and host nftables and still
+requires the corresponding networking and device privileges. If the account is
+listed in the group that owns `/dev/kvm` but `id` does not show that group, use
+`mise run gateway:vm` or the VM e2e runner; they re-exec through the configured
+group without sudo.
 
 Then run:
 

@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-isolation-vm"
+description = "Shared authenticated VM boundary transport for OpenShell isolation backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-isolation = { path = "../openshell-isolation" }
+openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-process = { path = "../openshell-supervisor-process" }
+
+async-trait = "0.1"
+libc = "0.2"
+nix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

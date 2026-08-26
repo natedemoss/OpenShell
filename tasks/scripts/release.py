@@ -283,6 +283,7 @@ class Openshell < Formula
 
     resource("openshell-driver-vm").stage do
       libexec.install "openshell-driver-vm"
+      libexec.install "openshell-sandbox"
     end
 
     (libexec/"openshell-gateway-homebrew-service").write <<~SH

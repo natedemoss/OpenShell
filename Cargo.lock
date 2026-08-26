@@ -4072,6 +4072,7 @@ dependencies = [
 name = "openshell-driver-vm"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "bollard",
  "clap",
  "flate2",
@@ -4083,6 +4084,8 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-isolation",
+ "openshell-isolation-vm",
  "openshell-otel",
  "openshell-otel-test-support",
  "openshell-policy",
@@ -4092,6 +4095,7 @@ dependencies = [
  "polling",
  "prost",
  "prost-types",
+ "rand 0.9.4",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4153,6 +4157,24 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "openshell-core",
+ "tokio",
+]
+
+[[package]]
+name = "openshell-isolation-vm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "nix 0.29.0",
+ "openshell-core",
+ "openshell-isolation",
+ "openshell-supervisor-network",
+ "openshell-supervisor-process",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -4257,12 +4279,14 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "futures",
  "miette",
  "nix 0.29.0",
  "openshell-core",
- "openshell-extension-core",
+ "openshell-isolation",
+ "openshell-isolation-vm",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4282,7 +4306,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

@@ -52,6 +52,8 @@ type KrunSetConsoleOutput = unsafe extern "C" fn(ctx_id: u32, filepath: *const c
 type KrunStartEnter = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunDisableImplicitVsock = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunAddVsock = unsafe extern "C" fn(ctx_id: u32, tsi_features: u32) -> i32;
+type KrunAddVsockPort2 =
+    unsafe extern "C" fn(ctx_id: u32, port: u32, filepath: *const c_char, listen: bool) -> i32;
 #[cfg(target_os = "macos")]
 type KrunAddNetUnixgram = unsafe extern "C" fn(
     ctx_id: u32,
@@ -86,6 +88,7 @@ pub struct LibKrun {
     pub krun_start_enter: KrunStartEnter,
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
     pub krun_add_vsock: KrunAddVsock,
+    pub krun_add_vsock_port2: KrunAddVsockPort2,
     #[cfg(target_os = "macos")]
     pub krun_add_net_unixgram: KrunAddNetUnixgram,
     #[allow(dead_code)] // Used on Linux when gvproxy runs in qemu/unixstream mode.
@@ -151,6 +154,7 @@ impl LibKrun {
                 &libkrun_path,
             )?,
             krun_add_vsock: load_symbol(library, b"krun_add_vsock\0", &libkrun_path)?,
+            krun_add_vsock_port2: load_symbol(library, b"krun_add_vsock_port2\0", &libkrun_path)?,
             #[cfg(target_os = "macos")]
             krun_add_net_unixgram: load_symbol(library, b"krun_add_net_unixgram\0", &libkrun_path)?,
             krun_add_net_unixstream: load_symbol(

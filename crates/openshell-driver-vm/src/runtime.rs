@@ -31,6 +31,13 @@ pub enum VmBackend {
     Qemu,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockPortMap {
+    pub guest_port: u32,
+    pub host_socket: PathBuf,
+    pub host_initiated: bool,
+}
+
 // virtio-net feature bits (see Linux `include/uapi/linux/virtio_net.h`).
 const NET_FEATURE_CSUM: u32 = 1 << 0;
 const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
@@ -66,6 +73,7 @@ pub struct VmLaunchConfig {
     pub vsock_cid: Option<u32>,
     pub guest_mac: Option<String>,
     pub gateway_port: Option<u16>,
+    pub vsock_port_map: Option<VsockPortMap>,
 }
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
@@ -818,6 +826,10 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
         vm.disable_implicit_vsock()?;
         vm.add_vsock(0)?;
+        if let Some(port_map) = &config.vsock_port_map {
+            let _ = std::fs::remove_file(&port_map.host_socket);
+            vm.add_vsock_port(port_map)?;
+        }
 
         let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
@@ -1115,6 +1127,21 @@ impl VmContext {
         check(
             unsafe { (self.krun.krun_add_vsock)(self.ctx_id, tsi_features) },
             "krun_add_vsock",
+        )
+    }
+
+    fn add_vsock_port(&self, port_map: &VsockPortMap) -> Result<(), String> {
+        let socket_c = path_to_cstring(&port_map.host_socket)?;
+        check(
+            unsafe {
+                (self.krun.krun_add_vsock_port2)(
+                    self.ctx_id,
+                    port_map.guest_port,
+                    socket_c.as_ptr(),
+                    port_map.host_initiated,
+                )
+            },
+            "krun_add_vsock_port2",
         )
     }
 
@@ -1437,6 +1464,7 @@ mod tests {
             vsock_cid: Some(4),
             guest_mac: Some("02:00:00:00:00:01".to_string()),
             gateway_port: Some(8080),
+            vsock_port_map: None,
         }
     }
 

@@ -50,6 +50,36 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
+## Isolation Backend
+
+[RFC 0012](../rfc/0012-isolation-backend/README.md) defines the Isolation
+Backend contract for topology-specific boundary construction and process
+operations. The contract uses consuming
+lifecycle states (`attach` → `Bound` → `confirm` → `Ready` → `start_agent` →
+`Running`) so untrusted workload execution cannot begin before standing
+enforcement is confirmed.
+
+The logical supervisor remains the trusted bridge between the gateway and the
+workload. It drives the backend and applies approved network policy through
+supervisor-owned mediation; the backend routes workload egress to that
+mediation. Existing container placements remain on their legacy lifecycle
+while the VM driver prototypes the backend contract.
+
+VM uses delegated placement. The logical supervisor stays on
+the host and sends admitted policy, workload state, and proxy CA material over
+a token-authenticated, backend-private virtio-vsock channel only after the RFC
+lifecycle reaches `start_agent`. The driver uses the portable
+`openshell-isolation-vm` guest leaf, which invokes the existing
+`openshell-supervisor-process` implementation inside the VM. The guest resolves
+workload socket/process identity from its own `/proc` and sends that evidence
+with network connections; the host supervisor performs policy evaluation and
+relays approved traffic. Exec/PTY and loopback forwarding use the same boundary
+transport. Gateway JWT and mTLS credentials never enter the guest.
+
+The VM guest installs and verifies its default-deny kernel egress ceiling before
+the host exposes workload execution. Boundary failure leaves the ceiling in
+place and triggers guest process cleanup.
+
 ## Network and Inference
 
 See [Sandbox Limits](sandbox-limits.md) for the current numeric safety ceilings,

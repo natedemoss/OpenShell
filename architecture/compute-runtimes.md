@@ -4,6 +4,12 @@ Compute runtimes create, stop, start, delete, and watch sandbox workloads for th
 gateway. They do not replace sandbox policy enforcement. Every runtime starts a
 workload that runs the `openshell-sandbox` supervisor, and the supervisor
 enforces the sandbox contract locally.
+Compute runtimes create, stop, delete, and watch sandbox workloads for the
+gateway. They do not replace sandbox policy enforcement. Container runtimes run
+the logical `openshell-sandbox` supervisor in the workload boundary. VM runtimes
+may instead run it on the host and use an authenticated process leaf inside the
+guest. In both placements the logical supervisor owns policy and the gateway
+session.
 
 ## Driver Contract
 
@@ -16,6 +22,9 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Forwarding the exact canonical main-process argv and TTY mode without shell
   reconstruction. The sandbox-level environment and policy workspace apply to
   the main process.
+- Injecting sandbox identity and the admitted topology descriptor.
+- Supplying TLS or secret material only to the logical supervisor placement.
+- Providing the logical supervisor and any boundary-local process leaf.
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
@@ -207,6 +216,8 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| VM | Experimental host-supervised microVM isolation. | Per-sandbox libkrun VM with a portable guest process leaf. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`; the driver starts a native logical supervisor and connects it to the guest over authenticated virtio-vsock. The guest has no gateway credentials. The existing custom kernel, cached bootstrap `rootfs.ext4`, in-VM `umoci` preparation, read-only image disk, writable `overlay.ext4`, and restart persistence remain unchanged. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -255,25 +266,29 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
 
-The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
-executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
-that identity when it execs the supervisor after mounting and network setup.
+The VM topology is delegated. libkrun executes the driver-owned guest bootstrap
+as PID 1; after mounting and network setup it execs `openshell-sandbox vm-guest`
+as the portable process leaf. The native host supervisor drives RFC 0012 over a
+driver-private, token-authenticated virtio-vsock transport. Lifecycle,
+exec/PTY, loopback forwarding, and mediated egress all cross this transport;
+gateway JWT and mTLS material remain on the host.
 
 ## Supervisor Delivery
 
-The supervisor must be available inside each sandbox workload:
+The logical supervisor or its boundary-local process leaf must be available at
+the placement selected by the runtime:
 
 | Runtime | Delivery model |
 |---|---|
 | Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
 | Podman | Read-only OCI image volume by default; host-cached bind mount when `userns` is configured. |
 | Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
-| VM | Embedded in the guest rootfs bundle. |
+| VM | Native host `openshell-sandbox` beside the driver; portable Linux process leaf embedded in the guest rootfs bundle. |
 | Extension | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
-values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
-paths, and command metadata.
+values for sandbox ID, sandbox name, relay path, and command metadata. Gateway
+endpoint and TLS values go only to the logical supervisor placement.
 
 ## Process Identity
 
@@ -285,7 +300,8 @@ driver then supplies one authoritative identity input to the supervisor:
   resolves the workspace from OCI `Config.WorkingDir` during that inspection.
 - Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
   SCC-derived values.
-- VM keeps its existing guest identity behavior.
+- VM resolves the configured numeric UID/GID on the host and transfers the pair
+  to the guest leaf as authenticated launch state.
 
 Explicit numeric workload identities may use any Linux UID/GID from `1`
 through `u32::MAX - 1`. UID/GID `0` remains prohibited as root, and

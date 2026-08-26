@@ -12,14 +12,15 @@ runtime/
 ```
 
 `openshell-driver-vm` embeds libkrun, libkrunfw, gvproxy, umoci for guest-side
-OCI image unpacking, and the bundled `openshell-sandbox` supervisor.
+OCI image unpacking, and the portable `openshell-sandbox vm-guest` process leaf.
 
 ## Why
 
 The stock `libkrunfw` kernel does not include the bridge, netfilter,
-conntrack, cgroup, seccomp, and Landlock features the sandbox supervisor needs
-inside each microVM. `kernel/openshell.kconfig` extends the libkrunfw kernel so
-VM sandboxes can run the same supervisor enforcement path as other backends.
+conntrack, cgroup, seccomp, and Landlock features the process leaf needs inside
+each microVM. `kernel/openshell.kconfig` extends the libkrunfw kernel so VM
+sandboxes retain guest-local process and filesystem enforcement while the
+logical supervisor runs on the host.
 
 ## Build Scripts
 
@@ -36,12 +37,12 @@ VM sandboxes can run the same supervisor enforcement path as other backends.
 # Download the current pre-built runtime and stage compressed artifacts
 mise run vm:setup
 
-# Build the bundled guest supervisor
+# Build the portable Linux guest leaf and trusted helper runtime (requires Docker Buildx)
 mise run vm:supervisor
 
-# Build the gateway and VM driver with embedded runtime artifacts
+# Build the gateway, native host supervisor, and VM driver
 OPENSHELL_VM_RUNTIME_COMPRESSED_DIR=$PWD/target/vm-runtime-compressed \
-  cargo build -p openshell-server -p openshell-driver-vm
+  cargo build -p openshell-server -p openshell-sandbox -p openshell-driver-vm
 ```
 
 Use `FROM_SOURCE=1 mise run vm:setup` to build the runtime from source instead

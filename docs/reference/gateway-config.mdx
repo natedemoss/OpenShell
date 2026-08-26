@@ -737,7 +737,7 @@ health_check_interval_secs = 10
 
 ### MicroVM
 
-Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
+Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. The logical supervisor runs natively on the host and drives an authenticated RFC 0012 boundary transport to a portable process leaf in the guest. The guest receives no gateway token or mTLS private key. The existing custom kernel and driver-controlled guest helper runtime remain part of the VM bootstrap. Use this driver when you want stronger isolation than container namespaces alone.
 
 ```toml
 [openshell]
@@ -754,21 +754,29 @@ state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir       = "/usr/local/libexec/openshell"
 default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
-grpc_endpoint    = "https://host.containers.internal:17670"
+# Host-reachable endpoint used by the native supervisor. Loopback is valid.
+grpc_endpoint    = "https://127.0.0.1:17670"
 # Empty falls back to default_image.
 bootstrap_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
 krun_log_level   = 1
 vcpus            = 2
 mem_mib          = 2048
 overlay_disk_mib = 4096
-guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Historical field names: these files are consumed by the host supervisor and
+# are never copied into the guest.
+guest_tls_ca     = "/var/lib/openshell/supervisor-tls/ca.pem"
+guest_tls_cert   = "/var/lib/openshell/supervisor-tls/client.pem"
+guest_tls_key    = "/var/lib/openshell/supervisor-tls/client-key.pem"
 # Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
 # Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
 # Any non-root Linux UID/GID is valid.
 # sandbox_uid = 20001
 ```
+
+`openshell-sandbox` must be installed beside `openshell-driver-vm` or selected
+with `OPENSHELL_VM_SUPERVISOR_BIN`. Linux drivers can fall back to extracting
+the same-target embedded guest binary for host execution. macOS packages ship a
+native supervisor sibling because the embedded process leaf targets Linux.
 
 ### Extension Driver
 
