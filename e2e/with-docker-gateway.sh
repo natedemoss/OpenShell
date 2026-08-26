@@ -115,9 +115,6 @@ DRIVER_LOG="${WORKDIR}/docker-driver.log"
 DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
 DRIVER_CONFIG="${WORKDIR}/docker-driver.toml"
 E2E_NAMESPACE=""
-DOCKER_NETWORK_NAME=""
-DOCKER_NETWORK_CONNECTED_CONTAINER=""
-DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
@@ -173,20 +170,6 @@ cleanup() {
     fi
   fi
 
-  if [ -n "${DOCKER_NETWORK_CONNECTED_CONTAINER}" ] \
-     && [ -n "${DOCKER_NETWORK_NAME}" ] \
-     && command -v docker >/dev/null 2>&1; then
-    docker network disconnect -f \
-      "${DOCKER_NETWORK_NAME}" \
-      "${DOCKER_NETWORK_CONNECTED_CONTAINER}" >/dev/null 2>&1 || true
-  fi
-
-  if [ "${DOCKER_NETWORK_MANAGED}" = "1" ] \
-     && [ -n "${DOCKER_NETWORK_NAME}" ] \
-     && command -v docker >/dev/null 2>&1; then
-    docker network rm "${DOCKER_NETWORK_NAME}" >/dev/null 2>&1 || true
-  fi
-
   e2e_print_gateway_log_on_failure "${exit_code}" "${GATEWAY_LOG}"
   if [ "${exit_code}" -ne 0 ] && [ -f "${DRIVER_LOG}" ]; then
     echo "=== external Docker compute driver log ==="
@@ -197,70 +180,6 @@ cleanup() {
   rm -rf "${WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-ensure_e2e_docker_network() {
-  local network=$1
-
-  if docker network inspect "${network}" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  docker network create \
-    --driver bridge \
-    --attachable \
-    --label openshell.ai/managed-by=openshell \
-    --label "openshell.ai/sandbox-namespace=${E2E_NAMESPACE}" \
-    "${network}" >/dev/null
-  DOCKER_NETWORK_MANAGED=1
-}
-
-github_actions_container_id() {
-  if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ ! -f /.dockerenv ]; then
-    return 1
-  fi
-
-  local container
-  container="$(hostname)"
-  if docker inspect "${container}" >/dev/null 2>&1; then
-    printf '%s\n' "${container}"
-    return 0
-  fi
-
-  return 1
-}
-
-connect_current_container_to_docker_network() {
-  local network=$1
-  local container
-
-  if ! container="$(github_actions_container_id)"; then
-    return 1
-  fi
-
-  local connect_err="${WORKDIR}/docker-network-connect.err"
-  if ! docker network connect \
-    --alias host.openshell.internal \
-    "${network}" \
-    "${container}" 2>"${connect_err}"; then
-    if ! grep -qi "already exists" "${connect_err}"; then
-      cat "${connect_err}" >&2
-      return 1
-    fi
-  fi
-
-  DOCKER_NETWORK_CONNECTED_CONTAINER="${container}"
-
-  local container_ip
-  container_ip="$(docker inspect \
-    --format "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" \
-    "${container}")"
-  if [ -z "${container_ip}" ]; then
-    echo "ERROR: failed to resolve current job container IP on Docker network ${network}" >&2
-    return 1
-  fi
-
-  GATEWAY_HOST_ALIAS_IP="${container_ip}"
-}
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   case "${OPENSHELL_GATEWAY_ENDPOINT}" in
@@ -467,19 +386,8 @@ JWT_DIR="${STATE_DIR}/jwt"
 
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
-DOCKER_NETWORK_NAME="${E2E_NAMESPACE}"
-GATEWAY_HOST_ALIAS_IP=""
-
-ensure_e2e_docker_network "${DOCKER_NETWORK_NAME}"
-export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
-export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
-if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
-  echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
-else
-  GATEWAY_HOST_ALIAS_IP=""
-fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
@@ -514,36 +422,26 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
   else
     printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
     printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
     printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
-    printf 'enable_bind_mounts = true\n'
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
-    fi
   fi
 } > "${GATEWAY_CONFIG}"
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
     printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
     printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
     printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
     printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
-    printf 'enable_bind_mounts = true\n'
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
-    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-      printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
-    fi
   } >"${DRIVER_CONFIG}"
   "${DRIVER_BIN}" \
     --bind-socket "${DRIVER_SOCKET}" \

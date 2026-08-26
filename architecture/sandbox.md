@@ -139,6 +139,14 @@ generation-pinned authorization form the transparent TCP security boundary.
 Docker and Podman do not currently advertise usable IPv6 egress for this
 substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
+Isolation backends may provide the same substrate without namespace listeners.
+Their DNS source carries bounded wire exchanges directly to policy DNS, and
+their connection source supplies the captured synthetic destination and calling
+binary identity with each stream. The Docker host-supervisor backend uses OCI
+seccomp user notification to inject those streams while Docker networking stays
+disabled. The supervisor therefore binds no workload-visible proxy or DNS port;
+the synthetic mapping and pinned-destination checks remain unchanged.
+
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
 credential resolves only when the request host, port, and path match an endpoint

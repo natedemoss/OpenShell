@@ -3953,6 +3953,7 @@ name = "openshell-driver-docker"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bollard",
  "bytes",
  "clap",
@@ -4301,6 +4302,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-driver-docker",
  "openshell-isolation",
  "openshell-isolation-vm",
  "openshell-ocsf",

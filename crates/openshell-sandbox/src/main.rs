@@ -242,6 +242,18 @@ struct Args {
     /// Base64-encoded opaque topology-descriptor payload.
     #[arg(long)]
     topology_payload_base64: Option<String>,
+
+    /// Backend asked to create a fresh isolation boundary.
+    #[arg(long)]
+    boundary_create_backend_name: Option<String>,
+
+    /// Isolation Backend interface version for a fresh boundary plan.
+    #[arg(long)]
+    boundary_create_version: Option<u32>,
+
+    /// Base64-encoded backend-private fresh boundary plan.
+    #[arg(long)]
+    boundary_create_payload_base64: Option<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -660,6 +672,39 @@ fn main() -> Result<()> {
                 ));
             }
         };
+        let boundary_create_plan = match (
+            args.boundary_create_backend_name,
+            args.boundary_create_version,
+            args.boundary_create_payload_base64,
+        ) {
+            (None, None, None) => None,
+            (Some(backend_name), Some(version), Some(payload)) => {
+                use base64::Engine as _;
+                Some(openshell_isolation::contract::BoundaryCreatePlan {
+                    backend_name,
+                    version,
+                    payload: base64::engine::general_purpose::STANDARD
+                        .decode(payload)
+                        .into_diagnostic()?,
+                })
+            }
+            _ => {
+                return Err(miette::miette!(
+                    "boundary create plan requires backend name, version, and payload"
+                ));
+            }
+        };
+        if topology_descriptor.is_some() && boundary_create_plan.is_some() {
+            return Err(miette::miette!(
+                "topology attachment and boundary creation are mutually exclusive"
+            ));
+        }
+        let boundary_provisioning = topology_descriptor
+            .map(openshell_isolation::contract::BoundaryProvisioning::Attach)
+            .or_else(|| {
+                boundary_create_plan
+                    .map(openshell_isolation::contract::BoundaryProvisioning::Create)
+            });
 
         run_sandbox(
             command,
@@ -679,7 +724,7 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
-            topology_descriptor,
+            boundary_provisioning,
         )
         .await
     })?;

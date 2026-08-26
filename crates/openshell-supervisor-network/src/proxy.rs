@@ -48,8 +48,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use self::destination::{
-    DestinationDenial, DestinationDenialKind, DestinationRequest, build_validation_plan,
-    validate_destination,
+    DestinationDenial, DestinationDenialKind, DestinationRequest, build_pinned_validation_plan,
+    build_validation_plan, validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -214,6 +214,7 @@ impl ProxyHandle {
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+        policy_dns_store: Option<Arc<crate::policy_dns::ResolvedEndpointStore>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -229,10 +230,11 @@ impl ProxyHandle {
             ));
         }
 
-        let listener = if network_mediation_source.is_none() {
-            Some(TcpListener::bind(http_addr).await.into_diagnostic()?)
-        } else {
+        let source_backed = network_mediation_source.is_some();
+        let listener = if source_backed {
             None
+        } else {
+            Some(TcpListener::bind(http_addr).await.into_diagnostic()?)
         };
         let local_addr = match listener.as_ref() {
             Some(listener) => listener.local_addr().into_diagnostic()?,
@@ -244,7 +246,11 @@ impl ProxyHandle {
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .dst_endpoint(Endpoint::from_ip(local_addr.ip(), local_addr.port()))
-                .message(format!("Proxy listening on {local_addr}"))
+                .message(if source_backed {
+                    "Proxy consuming isolation-boundary streams".to_string()
+                } else {
+                    format!("Proxy listening on {local_addr}")
+                })
                 .build();
             ocsf_emit!(event);
         }
@@ -337,7 +343,12 @@ impl ProxyHandle {
                         .accept()
                         .await
                         .map(|connection| {
-                            (connection.stream, Some(connection.binary_identity), None)
+                            (
+                                connection.stream,
+                                Some(connection.binary_identity),
+                                None,
+                                connection.destination,
+                            )
                         })
                         .map_err(ProxyAcceptError::Source)
                 } else {
@@ -351,12 +362,12 @@ impl ProxyHandle {
                             let workload_addr = stream.peer_addr().ok();
                             let proxy_addr = stream.local_addr().ok();
                             let stream: BoundaryDuplexStream = Box::new(stream);
-                            (stream, None, workload_addr.zip(proxy_addr))
+                            (stream, None, workload_addr.zip(proxy_addr), None)
                         })
                         .map_err(ProxyAcceptError::Listener)
                 };
                 match accepted {
-                    Ok((stream, supplied_identity, socket_addrs)) => {
+                    Ok((stream, supplied_identity, socket_addrs, transparent_destination)) => {
                         consecutive_resource_errors = 0;
                         consecutive_unknown_errors = 0;
                         let opa = opa_engine.clone();
@@ -368,6 +379,7 @@ impl ProxyHandle {
                         let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
                         let up_proxy = upstream_proxy.clone();
+                        let dns_store = policy_dns_store.clone();
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
@@ -384,6 +396,8 @@ impl ProxyHandle {
                                 tokio::io::BufReader::new(stream),
                                 supplied_identity,
                                 socket_addrs,
+                                transparent_destination,
+                                dns_store,
                                 opa,
                                 cache,
                                 spid,
@@ -446,7 +460,7 @@ impl ProxyHandle {
         });
 
         Ok(Self {
-            http_addr: Some(local_addr),
+            http_addr: (!source_backed).then_some(local_addr),
             join,
             source_failure,
         })
@@ -1188,6 +1202,8 @@ async fn handle_tcp_connection(
         tokio::io::BufReader::new(stream),
         None,
         socket_addrs,
+        None,
+        None,
         opa_engine,
         identity_cache,
         entrypoint_pid,
@@ -1205,11 +1221,52 @@ async fn handle_tcp_connection(
     .await
 }
 
+/// Adapt a transparent application stream to the existing CONNECT pipeline.
+/// The synthetic CONNECT request is supervisor-owned and its successful 200
+/// response is consumed before bytes are returned to the workload.
+fn virtual_connect_stream(
+    workload: BoundaryDuplexStream,
+    authority: String,
+) -> BoundaryDuplexStream {
+    let (handler, bridge) = tokio::io::duplex(64 * 1024);
+    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
+    let (mut workload_read, mut workload_write) = tokio::io::split(workload);
+    tokio::spawn(async move {
+        let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+        if bridge_write.write_all(request.as_bytes()).await.is_ok() {
+            let _ = tokio::io::copy(&mut workload_read, &mut bridge_write).await;
+        }
+        let _ = bridge_write.shutdown().await;
+    });
+    tokio::spawn(async move {
+        let mut header = Vec::with_capacity(256);
+        let mut byte = [0_u8; 1];
+        while header.len() < MAX_HEADER_BYTES {
+            match bridge_read.read(&mut byte).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => header.push(byte[0]),
+            }
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        if !header.starts_with(b"HTTP/1.1 200 ") && !header.starts_with(b"HTTP/1.0 200 ") {
+            let _ = workload_write.shutdown().await;
+            return;
+        }
+        let _ = tokio::io::copy(&mut bridge_read, &mut workload_write).await;
+        let _ = workload_write.shutdown().await;
+    });
+    Box::new(handler)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_mediated_connection(
     mut client: ProxyClient,
     supplied_identity: Option<Result<ContractBinaryIdentity, ResolveError>>,
     socket_addrs: Option<(SocketAddr, SocketAddr)>,
+    transparent_destination: Option<SocketAddr>,
+    policy_dns_store: Option<Arc<crate::policy_dns::ResolvedEndpointStore>>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -1230,6 +1287,28 @@ async fn handle_mediated_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
 ) -> Result<()> {
+    let transparent_mapping = if let Some(destination) = transparent_destination {
+        let store = policy_dns_store
+            .as_ref()
+            .ok_or_else(|| miette::miette!("transparent connection arrived without policy DNS"))?;
+        let mapping = store
+            .lookup(
+                destination.ip(),
+                destination.port(),
+                opa_engine.current_generation(),
+                std::time::Instant::now(),
+            )
+            .map_err(|error| miette::miette!("transparent destination denied: {error}"))?;
+        let authority = format!(
+            "{}:{}",
+            mapping.record.normalized_name.as_str(),
+            destination.port()
+        );
+        client = tokio::io::BufReader::new(virtual_connect_stream(client.into_inner(), authority));
+        Some(mapping)
+    } else {
+        None
+    };
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
 
@@ -1484,6 +1563,13 @@ async fn handle_mediated_connection(
             .await?;
             return Ok(());
         }
+    }
+    if let Some(mapping) = transparent_mapping.as_ref() {
+        decision.endpoint.destination = Some(
+            build_pinned_validation_plan(mapping.pinned_addresses()).map_err(|denial| {
+                miette::miette!("transparent destination mapping denied: {}", denial.reason)
+            })?,
+        );
     }
     let destination_plan = decision
         .endpoint
@@ -5409,6 +5495,26 @@ mod tests {
 
     struct FailedMediationSource;
 
+    #[tokio::test]
+    async fn virtual_connect_is_portless_and_hides_the_synthetic_handshake() {
+        let (workload, mut workload_peer) = tokio::io::duplex(1024);
+        let mut handler = virtual_connect_stream(Box::new(workload), "api.example.com:443".into());
+
+        workload_peer.write_all(b"client-tls").await.unwrap();
+        let mut request = vec![0_u8; 128];
+        let length = handler.read(&mut request).await.unwrap();
+        let request = &request[..length];
+        assert!(request.starts_with(b"CONNECT api.example.com:443 HTTP/1.1\r\n"));
+
+        handler
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nserver-tls")
+            .await
+            .unwrap();
+        let mut response = [0_u8; 10];
+        workload_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"server-tls");
+    }
+
     #[async_trait::async_trait]
     impl NetworkMediationSource for FailedMediationSource {
         async fn accept(
@@ -5493,6 +5599,7 @@ network_policies: {}
             ready_rx,
             &upstream_proxy::UpstreamProxyArgs::default(),
             Some(Arc::new(FailedMediationSource)),
+            None,
         )
         .await
         .expect("proxy starts before source accept");

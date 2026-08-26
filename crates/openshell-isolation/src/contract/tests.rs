@@ -97,6 +97,7 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
                 ancestors: vec![],
                 cmdline_paths: vec![],
             }),
+            destination: None,
         })
     }
 }
@@ -113,6 +114,7 @@ impl NetworkMediationSource for UnattributedSource {
         Ok(MediatedConnection {
             stream: Box::new(near),
             binary_identity: Err(ResolveError::Failed("hash unavailable".to_string())),
+            destination: None,
         })
     }
 }

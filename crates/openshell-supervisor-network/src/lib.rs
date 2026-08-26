@@ -13,6 +13,7 @@ pub mod identity_source;
 pub mod inference_routes;
 pub mod l7;
 pub mod opa;
+mod policy_dns;
 pub mod policy_local;
 pub mod procfs;
 pub mod proxy;

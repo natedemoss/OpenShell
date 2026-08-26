@@ -18,6 +18,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-isolation = { path = "../openshell-isolation" }
 openshell-isolation-vm = { path = "../openshell-isolation-vm" }
+openshell-driver-docker = { path = "../openshell-driver-docker" }
 base64 = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }

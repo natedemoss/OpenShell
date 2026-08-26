@@ -34,19 +34,20 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
 
 pub use openshell_core::policy::SandboxPolicy;
 
 /// The Isolation Backend contract version. The descriptor and the resolved
 /// backend must both equal the supervisor-supported version exactly.
-pub const INTERFACE_VERSION: u32 = 1;
+pub const INTERFACE_VERSION: u32 = 2;
 
 // ============================================================================
 // Errors
@@ -621,6 +622,13 @@ pub trait BoundBoundary: Send {
     /// Retained by the supervisor before consuming `Bound`.
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
 
+    /// Optional transport for workload DNS exchanges. Backends that expose
+    /// this source keep DNS inside the supervisor-owned policy path rather
+    /// than granting the workload access to a resolver socket.
+    fn dns_mediation_source(&self) -> Option<Arc<dyn DnsMediationSource>> {
+        None
+    }
+
     /// Confirm standing enforcement. How a backend establishes confidence is
     /// private to that backend; confirmation fails closed.
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
@@ -873,6 +881,9 @@ pub struct MediatedConnection {
     pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
+    /// Original destination captured by the backend. Explicit-proxy
+    /// transports leave this absent; transparent transports must supply it.
+    pub destination: Option<SocketAddr>,
 }
 
 /// A logical per-boundary stream of workload connections, consumed by the
@@ -888,6 +899,35 @@ pub struct MediatedConnection {
 pub trait NetworkMediationSource: Send + Sync {
     /// Await the next mediated workload connection.
     async fn accept(&self) -> Result<MediatedConnection, BackendError>;
+}
+
+/// DNS transport used by one workload exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsTransport {
+    /// One DNS wire datagram without a TCP length prefix.
+    Udp,
+    /// One two-byte-length-prefixed DNS message.
+    Tcp,
+}
+
+/// One workload DNS request and its fail-closed response channel.
+pub struct MediatedDnsQuery {
+    /// DNS request bytes in the framing selected by [`Self::transport`].
+    pub request: Vec<u8>,
+    /// Workload DNS transport.
+    pub transport: DnsTransport,
+    /// Identity of the process that issued the DNS request.
+    pub binary_identity: Result<BinaryIdentity, ResolveError>,
+    /// Single-use response channel owned by the backend adapter.
+    pub response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
+}
+
+/// Logical per-boundary stream of DNS exchanges. The backend handles syscall,
+/// packet, or guest-agent transport details; the supervisor owns policy DNS.
+#[async_trait]
+pub trait DnsMediationSource: Send + Sync {
+    /// Await the next DNS query from this boundary.
+    async fn accept(&self) -> Result<MediatedDnsQuery, BackendError>;
 }
 
 #[cfg(test)]

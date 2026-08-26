@@ -37,7 +37,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
-use openshell_isolation::contract::NetworkMediationSource;
+use openshell_isolation::contract::{DnsMediationSource, NetworkMediationSource};
 
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
@@ -54,6 +54,7 @@ pub struct Networking {
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
     pub policy_local_ctx: Arc<PolicyLocalContext>,
+    _policy_dns: Option<crate::policy_dns::PolicyDnsRuntime>,
 }
 
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
@@ -92,6 +93,7 @@ pub async fn run_networking(
     workspace_rx: tokio::sync::watch::Receiver<String>,
     upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
     network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    dns_mediation_source: Option<Arc<dyn DnsMediationSource>>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -273,6 +275,21 @@ pub async fn run_networking(
         (None, None)
     };
 
+    let policy_dns = if let Some(source) = dns_mediation_source {
+        let engine = opa_engine
+            .cloned()
+            .ok_or_else(|| miette::miette!("Mediated DNS requires an OPA engine"))?;
+        Some(crate::policy_dns::PolicyDnsRuntime::start_mediated(
+            engine,
+            source,
+            None,
+            crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
+            engine_ready_rx.clone(),
+        )?)
+    } else {
+        None
+    };
+
     let proxy_handle = if matches!(policy.network.mode, NetworkMode::Proxy) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
@@ -319,6 +336,7 @@ pub async fn run_networking(
             engine_ready_rx,
             upstream_proxy_args,
             network_mediation_source,
+            policy_dns.as_ref().map(|runtime| runtime.store.clone()),
         )
         .await?;
         Some(proxy_handle)
@@ -330,5 +348,6 @@ pub async fn run_networking(
         proxy: proxy_handle,
         ca_file_paths,
         policy_local_ctx,
+        _policy_dns: policy_dns,
     })
 }

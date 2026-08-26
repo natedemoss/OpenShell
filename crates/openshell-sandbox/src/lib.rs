@@ -104,7 +104,7 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    topology_descriptor: Option<openshell_isolation::contract::TopologyDescriptor>,
+    boundary_provisioning: Option<openshell_isolation::contract::BoundaryProvisioning>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -341,28 +341,35 @@ pub async fn run_sandbox(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    if let Some(descriptor) = topology_descriptor {
+    if let Some(provisioning) = boundary_provisioning {
         if sidecar_network_enforcement || !network_enabled || !process_enabled {
             return Err(miette::miette!(
-                "the VM isolation backend requires combined network,process mode"
-            ));
-        }
-        if descriptor.backend_name != "vm" {
-            return Err(miette::miette!(
-                "unsupported prototype isolation backend {:?}; expected \"vm\"",
-                descriptor.backend_name
+                "isolation backends require combined network,process mode"
             ));
         }
 
         let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
         let proxy_bind_ip = Arc::new(std::sync::Mutex::new(None));
-        let admitted_backend_name = descriptor.backend_name.clone();
-        let backend: Arc<dyn openshell_isolation::contract::IsolationBackend> =
-            Arc::new(openshell_isolation_vm::VmHostBackend::new(
+        let admitted_backend_name = provisioning.backend_name().to_string();
+        let backend: Arc<dyn openshell_isolation::contract::IsolationBackend> = match admitted_backend_name.as_str() {
+            "vm" => Arc::new(openshell_isolation_vm::VmHostBackend::new(
                 "vm",
                 ca_file_paths.clone(),
                 provider_env.clone(),
-            ));
+            )),
+            #[cfg(target_os = "linux")]
+            "docker" => Arc::new(
+                openshell_driver_docker::isolation::DockerIsolationBackend::from_host_environment(
+                    provider_env.clone(),
+                )
+                .map_err(|error| miette::miette!(error.to_string()))?,
+            ),
+            other => {
+                return Err(miette::miette!(
+                    "unsupported isolation backend {other:?}"
+                ));
+            }
+        };
         let mut registry = openshell_isolation::contract::BackendRegistry::new();
         registry
             .register(backend)
@@ -379,16 +386,13 @@ pub async fn run_sandbox(
             },
         };
         let provisioned = registry
-            .provision(
-                openshell_isolation::contract::BoundaryProvisioning::Attach(descriptor),
-                &admitted_backend_name,
-                context,
-            )
+            .provision(provisioning, &admitted_backend_name, context)
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
-        let (_recovery_descriptor, origin, bound) = provisioned.into_parts();
+        let (recovery_descriptor, origin, bound) = provisioned.into_parts();
         info!(backend = %admitted_backend_name, ?origin, "Isolation boundary provisioned");
         let network_mediation_source = bound.network_mediation_source();
+        let dns_mediation_source = bound.dns_mediation_source();
         let mediation_bind_ip = *proxy_bind_ip.lock().expect("proxy bind IP lock");
         let networking = openshell_supervisor_network::run::run_networking(
             &policy,
@@ -408,6 +412,7 @@ pub async fn run_sandbox(
             workspace_rx.clone(),
             &upstream_proxy_args,
             Some(network_mediation_source),
+            dns_mediation_source,
         )
         .await?;
         info!(
@@ -567,6 +572,18 @@ pub async fn run_sandbox(
         drop(boundary_access);
         drop(networking);
 
+        if origin == openshell_isolation::contract::BoundaryOrigin::SupervisorCreated {
+            registry
+                .destroy_created(
+                    recovery_descriptor,
+                    origin,
+                    &admitted_backend_name,
+                    sandbox_id.as_deref().unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| miette::miette!(error.to_string()))?;
+        }
+
         return result;
     }
 
@@ -605,6 +622,7 @@ pub async fn run_sandbox(
                 agent_proposals.clone(),
                 workspace_rx.clone(),
                 &upstream_proxy_args,
+                None,
                 None,
             )
             .await?,

@@ -594,6 +594,7 @@ impl NetworkMediationSource for VmNetworkMediation {
         Ok(MediatedConnection {
             stream,
             binary_identity: identity.into_result(),
+            destination: None,
         })
     }
 }

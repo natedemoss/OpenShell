@@ -164,21 +164,6 @@ enable_bind_mounts = true
     }
 
     #[test]
-    fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r"
-[openshell.drivers.docker]
-enable_bind_mounts = true
-",
-        )
-        .expect("valid config");
-
-        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
-
-        assert!(cfg.enable_bind_mounts);
-    }
-
-    #[test]
     fn docker_config_reads_socket_path_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"

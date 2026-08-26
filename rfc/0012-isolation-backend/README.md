@@ -212,6 +212,7 @@ struct SandboxContext {
 #[async_trait]
 trait BoundBoundary: Send {
     fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
+    fn dns_mediation_source(&self) -> Option<Arc<dyn DnsMediationSource>>;
 
     async fn confirm(
         self: Box<Self>,
@@ -302,10 +303,31 @@ trait NetworkMediationSource: Send + Sync {
 struct MediatedConnection {
     stream: BoundaryDuplexStream,
     binary_identity: Result<BinaryIdentity, ResolveError>,
+    destination: Option<SocketAddr>,
+}
+
+#[async_trait]
+trait DnsMediationSource: Send + Sync {
+    async fn accept(&self) -> Result<MediatedDnsQuery, BackendError>;
+}
+
+struct MediatedDnsQuery {
+    request: Vec<u8>,
+    transport: DnsTransport,
+    binary_identity: Result<BinaryIdentity, ResolveError>,
+    response: oneshot::Sender<Result<Vec<u8>, BackendError>>,
 }
 ```
 
 `NetworkMediationSource` supplies outbound connections from one boundary to supervisor-owned network mediation. The backend routes all workload egress through that source and authoritatively associates each connection with the boundary without relying solely on workload-provided data. Capture, transport, placement, and coordination are backend-private.
+
+Explicit-proxy transports leave `destination` absent. Transparent transports
+capture the original socket destination and supply it before the supervisor
+consumes workload bytes. `DnsMediationSource` carries portless DNS exchanges to
+the supervisor-owned policy DNS service. It is optional because explicit-proxy
+topologies resolve destinations in the supervisor and do not expose workload
+DNS. A backend that advertises transparent networking supplies both sources;
+DNS or connection-source failure closes that boundary's egress.
 
 Every topology may use the same supervisor-owned mediation libraries or services; the source does not require a backend-specific policy engine.
 
