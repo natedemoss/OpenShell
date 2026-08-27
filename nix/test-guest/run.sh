@@ -12,8 +12,8 @@ Usage:
   nix run .#test-guest -- --distro DISTRO [OPTIONS] [-- COMMAND...]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
+  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
+  --with NAME         Apply a configuration; repeatable (docker, podman, podman-rootless, selinux)
   --install PATH      Install a .deb or .rpm package; repeatable
   --copy SRC:DEST     Copy an executable to an absolute guest path; repeatable
   --ssh-port PORT     Use a specific loopback SSH forwarding port
