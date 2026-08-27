@@ -28,6 +28,8 @@ Options:
   --host-cli-bin PATH  Use a prebuilt host openshell CLI instead of building it
   --gateway-bin PATH   Use a prebuilt openshell-gateway instead of building it
   --sandbox-bin PATH   Use a prebuilt openshell-sandbox instead of building it
+  --guest-gateway-user USER
+                       Run the VM guest gateway as USER (openshell or root)
   --gateway-config PATH
                        Fully resolved gateway TOML
   --features FEATURES  Rust e2e feature set to enable (default: e2e)
@@ -99,6 +101,7 @@ gateway_config=
 gateway_bin=
 host_cli_bin=
 sandbox_bin=
+guest_gateway_user=openshell
 e2e_features=e2e
 suite_name=
 with_configurations=()
@@ -128,6 +131,11 @@ while [ "$#" -gt 0 ]; do
 	--sandbox-bin)
 		require_value "$1" "$#" "${2:-}"
 		sandbox_bin="$(resolve_file "$2")" || die "--sandbox-bin does not name a file: $2"
+		shift 2
+		;;
+	--guest-gateway-user)
+		require_value "$1" "$#" "${2:-}"
+		guest_gateway_user=$2
 		shift 2
 		;;
 	--gateway-config)
@@ -172,6 +180,10 @@ print(tomllib.load(open(sys.argv[1], "rb"))["openshell"]["gateway"]["compute_dri
 if [ -z "${e2e_features}" ]; then
 	die "--features must not be empty"
 fi
+case "${guest_gateway_user}" in
+openshell | root) ;;
+*) die "--guest-gateway-user must be 'openshell' or 'root'" ;;
+esac
 if [ -n "${suite_name}" ]; then
 	if [[ ! ${suite_name} =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
 		die "suite name must contain only lowercase letters, digits, underscores, and hyphens: ${suite_name}"
@@ -440,6 +452,7 @@ gateway_endpoint="http://127.0.0.1:${host_port}"
 export OPENSHELL_GATEWAY_ENDPOINT="${gateway_endpoint}"
 export OPENSHELL_GATEWAY="${gateway_name}"
 export OPENSHELL_BIN="${host_cli_bin}"
+export OPENSHELL_E2E_DRIVER="${gateway_driver}"
 
 if [ "${mode}" = host ]; then
 	case "${gateway_driver}" in
@@ -516,19 +529,37 @@ docker)
 		"${supervisor_image}" >/dev/null
 	;;
 podman)
-	podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
-		--change 'ENTRYPOINT ["/openshell-sandbox"]' \
-		"${guest_supervisor_archive_path}" \
-		"${supervisor_image}" >/dev/null
+	if [ '${guest_gateway_user}' = root ]; then
+		sudo podman --url "unix:///run/podman/podman.sock" import \
+			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${guest_supervisor_archive_path}" \
+			"${supervisor_image}" >/dev/null
+	else
+		podman --url "unix:///run/user/\$(id -u)/podman/podman.sock" import \
+			--change 'ENTRYPOINT ["/openshell-sandbox"]' \
+			"${guest_supervisor_archive_path}" \
+			"${supervisor_image}" >/dev/null
+	fi
 	;;
 esac
 report_timing "${gateway_driver} supervisor import" "\${phase_started_at}"
 cd /home/openshell
-exec /usr/local/bin/openshell-gateway \
-	--config "\${config_path}" \
-	--bind-address 127.0.0.1 \
-	--port ${guest_port} \
+gateway_args=(
+	/usr/local/bin/openshell-gateway
+	--config "\${config_path}"
+	--bind-address 127.0.0.1
+	--port ${guest_port}
 	--disable-tls
+)
+if [ '${guest_gateway_user}' = root ]; then
+	exec sudo env \
+		XDG_CONFIG_HOME="\${XDG_CONFIG_HOME}" \
+		XDG_CACHE_HOME="\${XDG_CACHE_HOME}" \
+		XDG_DATA_HOME="\${XDG_DATA_HOME}" \
+		XDG_STATE_HOME="\${XDG_STATE_HOME}" \
+		"\${gateway_args[@]}"
+fi
+exec "\${gateway_args[@]}"
 EOF
 	chmod 0700 "${guest_launcher}"
 

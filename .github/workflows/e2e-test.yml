@@ -207,6 +207,81 @@ jobs:
             --gateway-config e2e/configs/gateway/podman.toml \
             --features e2e-podman
 
+  e2e-podman-fedora-rootful:
+    name: E2E (rust-podman-rootful, Fedora Nix VM)
+    # Run rootful Podman inside a Nix-managed Fedora guest. This exercises the
+    # RPM-family rootful bridge/listener topology without nesting Podman inside
+    # a Docker job container.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+          persist-credentials: false
+
+      - name: Use prebuilt OpenShell CLI
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell sandbox
+        uses: ./.github/actions/setup-e2e-sandbox
+        with:
+          artifact-prefix: ${{ inputs.sandbox-artifact-prefix }}
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            pkg-config
+
+      - name: Run Fedora rootful Podman E2E
+        run: |
+          set -euo pipefail
+
+          mise x -- e2e/run.sh \
+            --vm fedora \
+            --with podman-rootful \
+            --guest-gateway-user root \
+            --host-cli-bin "$OPENSHELL_BIN" \
+            --gateway-bin "$OPENSHELL_GATEWAY_BIN" \
+            --sandbox-bin "$OPENSHELL_SANDBOX_BIN" \
+            --gateway-config e2e/configs/gateway/podman-rootful.toml \
+            --features e2e-podman \
+            --suite sandbox_lifecycle
+
   e2e-vm:
     name: E2E (rust-vm-${{ matrix.suite }})
     # libkrun needs KVM, so this job must run directly on a GitHub-hosted

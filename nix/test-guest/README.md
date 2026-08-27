@@ -40,6 +40,7 @@ nix/test-guest/
 │   └── rocky.nix
 └── configuration/
     ├── docker.yml
+    ├── podman-rootful.yml
     ├── podman-rootless.yml
     ├── podman.yml
     └── selinux.yml
@@ -58,13 +59,13 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 
 ## Supported configurations
 
-| Distro | Docker | Podman | Rootless Podman | SELinux | Package format |
-| --- | --- | --- | --- | --- | --- |
-| Ubuntu 24.04 | Yes | Yes | No | No | `.deb` |
-| Ubuntu 26.04 | Yes | Yes | Yes | No | `.deb` |
-| CentOS Stream 10 | No | Yes | No | Yes | `.rpm` |
-| Fedora 44 | No | Yes | No | Yes | `.rpm` |
-| Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
+| Distro | Docker | Podman | Rootful Podman | Rootless Podman | SELinux | Package format |
+| --- | --- | --- | --- | --- | --- | --- |
+| Ubuntu 24.04 | Yes | Yes | No | No | No | `.deb` |
+| Ubuntu 26.04 | Yes | Yes | No | Yes | No | `.deb` |
+| CentOS Stream 10 | No | Yes | Yes | No | Yes | `.rpm` |
+| Fedora 44 | No | Yes | Yes | No | Yes | `.rpm` |
+| Rocky Linux 9 | Yes | Yes | Yes | No | Yes | `.rpm` |
 
 The Ubuntu 24.04 Podman configuration is available for runtime and packaging
 checks, but its Podman 4 release does not provide the `pasta` rootless network
@@ -97,6 +98,7 @@ Other combinations use the same interface:
 nix run .#test-guest -- --distro rocky --with docker
 nix run .#test-guest -- --distro centos --with podman
 nix run .#test-guest -- --distro fedora --with podman
+nix run .#test-guest -- --distro fedora --with podman-rootful
 nix run .#test-guest -- --distro ubuntu-26-04 --with podman-rootless
 ```
 
@@ -182,7 +184,7 @@ Cache command options:
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman, or selinux; repeatable
+--with NAME         Apply docker, podman, podman-rootful, podman-rootless, or selinux; repeatable
 --repository REF    OCI repository without a tag
 --digest DIGEST     Trusted OCI manifest digest required for pulls
 --cache-dir PATH    Override the local prepared-disk cache directory
@@ -233,7 +235,7 @@ The destination must be an absolute guest path. Copied files are installed with 
 
 ```text
 --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
---with NAME         Apply docker, podman, or selinux; repeatable
+--with NAME         Apply docker, podman, podman-rootful, podman-rootless, or selinux; repeatable
 --install PATH      Install a .deb or .rpm package; repeatable
 --copy SRC:DEST     Copy an executable into the guest; repeatable
 --ssh-port PORT     Use a specific loopback SSH forwarding port
