@@ -204,6 +204,14 @@ reuses them when refreshing an access token. This preserves the intended API
 resource selection for identity providers that bind access-token audiences to
 OAuth scopes.
 
+Python and Go SDK client-credentials providers can use the same registered
+issuer, client ID, audience, and scope metadata; the TypeScript provider accepts
+those fields explicitly. All three own a separate in-memory lifecycle, repeat
+the grant before expiry, and never persist the client secret or acquired access
+token into the CLI token cache. They require TLS when sending renewable bearer
+credentials to non-loopback gateways. This keeps non-interactive SDK
+authentication independent from refresh-token rotation and shared disk state.
+
 Gateway health and user authentication are separate probes. `OpenShell.Health`
 remains unauthenticated so deployment and load-balancer health checks do not
 depend on user credentials. The CLI uses the existing, side-effect-free
@@ -357,6 +365,15 @@ use server-owned encrypted database credential storage for defense in depth.
 Multi-replica deployments can use that default with a shared database and
 shared key-encryption key, or opt into an external backend such as Vault or
 Kubernetes Secrets.
+
+OAuth refresh failures retain a gateway-owned recovery classification alongside
+the refresh state. The gateway reads only a bounded error response and maps
+recognized OAuth codes to retry, reauthorization, configuration repair, or
+investigation without persisting issuer-controlled descriptions. Terminal
+reauthorization failures remain parked until a manual retry or explicit refresh
+reconfiguration. Configuration failures retry hourly so an externally repaired
+clock, policy, or stored credential can recover without rapid endpoint traffic;
+short-lived credentials still fail closed at their recorded expiry.
 
 Credential handles remain bound to the driver that created them. Before the
 0.1.0 compatibility boundary, gateways do not migrate inline refresh material
@@ -722,7 +739,9 @@ inbound request to provide a parent. gRPC status is recorded when response
 trailers arrive.
 
 The gateway forwards OTLP configuration and W3C trace context to managed
-external drivers. Each driver exports under its own service name.
+external drivers. Built-in drivers use dedicated in-process providers that
+preserve the same RPC trace boundary. Each driver exports to the configured
+collector under its own service name.
 
 Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
 failure stops the gateway from serving: a malformed endpoint is logged at

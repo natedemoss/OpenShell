@@ -500,7 +500,7 @@ async fn run_from_args(
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level)),
         &tracing_log_bus,
         otlp_config,
-        crate::tracing_setup::podman_export_enabled(&compute_driver),
+        &compute_driver,
     );
 
     let has_client_ca = prepared
@@ -796,7 +796,12 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
 fn is_singleplayer_driver(driver: Option<ComputeDriverKind>) -> bool {
     matches!(
         driver,
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::Mxc
+        )
     )
 }
 
@@ -1667,6 +1672,7 @@ ssh_session_ttl_secs = 1234
             openshell_core::ComputeDriverKind::Docker,
             openshell_core::ComputeDriverKind::Podman,
             openshell_core::ComputeDriverKind::Vm,
+            openshell_core::ComputeDriverKind::Mxc,
         ] {
             assert!(
                 super::is_singleplayer_driver(Some(driver)),
